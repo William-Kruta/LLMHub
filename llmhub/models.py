@@ -92,3 +92,17 @@ class AgentConfigUpdate(BaseModel):
     name: str | None = None
     tools: list[str] | None = None
     soul_md_path: str | None = None
+
+
+class TaskResult(BaseModel):
+    """Result of a completed research task run."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_id: str
+    config_id: str
+    filename: str
+    started_at: str  # ISO 8601
+    completed_at: str | None = None
+    status: str  # "complete" | "error"
+    report: str | None = None
+    error: str | None = None
