@@ -148,13 +148,20 @@ def chat_completion(config_id: str, request: ChatRequest):
 
     server_url = "http://" + config.host
 
-    if request.use_agent:
-        agent = chat.get_kharness_agent(config_id, server_url=server_url, port=config.port)
+    if request.agent_id:
+        agent_config = agent_manager.get_agent(request.agent_id)
+        if not agent_config:
+            raise HTTPException(status_code=400, detail="Agent not found")
         try:
-            response_text = agent.run(
-                request.message,
-                max_tokens=request.max_tokens,
+            agent = chat.get_kharness_agent(
+                config_id=config_id,
+                agent_id=request.agent_id,
+                server_url=server_url,
+                port=config.port,
+                tool_names=agent_config.tools,
+                soul_md_path=agent_config.soul_md_path,
             )
+            response_text = agent.run(request.message, max_tokens=request.max_tokens)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
