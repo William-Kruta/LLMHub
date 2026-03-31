@@ -8,6 +8,8 @@ const API_BASE = '/api';
 let currentPage = 'hub';
 let servers = [];
 let agents = [];
+let taskHistory = [];
+let currentRunId = null;
 
 // ── Router ─────────────────────────────────────────────
 function navigate(page) {
@@ -87,9 +89,17 @@ async function fetchAgents() {
     }
 }
 
+async function fetchTaskHistory() {
+    try {
+        taskHistory = await apiGet('/tasks/history');
+    } catch (e) {
+        taskHistory = [];
+    }
+}
+
 // ── Render ─────────────────────────────────────────────
 async function render() {
-    await Promise.all([fetchServers(), fetchAgents()]);
+    await Promise.all([fetchServers(), fetchAgents(), fetchTaskHistory()]);
     const main = document.getElementById('main-content');
     if (currentPage === 'hub') {
         main.innerHTML = renderHubPage();
@@ -100,6 +110,9 @@ async function render() {
     } else if (currentPage === 'agents') {
         main.innerHTML = renderAgentPage();
         bindAgentEvents();
+    } else if (currentPage === 'tasks') {
+        main.innerHTML = renderTaskPage();
+        bindTaskEvents();
     } else if (currentPage === 'terminal') {
         main.innerHTML = renderTerminalPage();
         bindTerminalEvents();
@@ -746,6 +759,75 @@ function bindChatEvents() {
         this.style.height = '48px';
         this.style.height = (this.scrollHeight) + 'px';
     });
+}
+
+// ── Tasks Page ─────────────────────────────────────────
+function renderTaskPage() {
+    const serverOptions = servers.map(s =>
+        `<option value="${s.config.id}">${escapeHtml(s.config.name)}${s.running ? '' : ' (stopped)'}</option>`
+    ).join('');
+
+    const agentOptions = agents.length
+        ? agents.map(a => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('')
+        : '<option value="" disabled>No agents configured</option>';
+
+    const historyItems = taskHistory.map(r => {
+        const agentName = agents.find(a => a.id === r.agent_id)?.name || r.agent_id;
+        const ago = relativeTime(r.completed_at || r.started_at);
+        return `<div class="task-history-item" data-report="${escapeHtml(r.report || '')}" data-filename="${escapeHtml(r.filename)}">
+            <span class="task-history-name">${escapeHtml(r.filename)}</span>
+            <span class="task-history-meta">${escapeHtml(agentName)} &middot; ${ago}</span>
+        </div>`;
+    }).join('');
+
+    return `
+        <div class="page-header">
+            <div>
+                <h1>Tasks</h1>
+                <p class="subtitle">Run research tasks with an agent and view results</p>
+            </div>
+        </div>
+        <div class="task-layout">
+            <div class="task-left-panel">
+                <div class="form-group">
+                    <label for="task-server-select">Server</label>
+                    <select id="task-server-select">${servers.length ? serverOptions : '<option value="" disabled>No servers configured</option>'}</select>
+                </div>
+                <div class="form-group">
+                    <label for="task-agent-select">Agent</label>
+                    <select id="task-agent-select">${agentOptions}</select>
+                </div>
+                <div class="form-group">
+                    <label for="task-file-input">Task File (.md)</label>
+                    <input type="file" id="task-file-input" accept=".md,text/markdown">
+                </div>
+                <button class="btn btn-primary" id="task-run-btn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>
+                    Run Task
+                </button>
+                ${taskHistory.length ? `
+                <div class="task-history-section">
+                    <div class="task-history-label">History</div>
+                    ${historyItems}
+                </div>` : ''}
+            </div>
+            <div class="task-right-panel" id="task-right-panel">
+                <div class="task-empty-state">
+                    <p>Upload a markdown file and click Run Task to start.</p>
+                </div>
+            </div>
+        </div>`;
+}
+
+function relativeTime(isoString) {
+    if (!isoString) return '';
+    const diff = Date.now() - new Date(isoString).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + 'm ago';
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    return Math.floor(hrs / 24) + 'd ago';
 }
 
 // ── Modal ──────────────────────────────────────────────
