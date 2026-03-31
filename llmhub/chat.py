@@ -8,21 +8,163 @@ import requests
 from kharness.providers import LlamaCpp as KHarnessLlamaCpp
 from kharness.agent import Agent as KHarnessAgentBase
 from kharness.memory import Memory as KHarnessMemory
-from kharness.memory import Memory
 from kharness.tools import WEB_TOOL_MAP, STOCK_TOOL_MAP
 
 # All tools available for agent construction, keyed by individual tool name
 _ALL_TOOLS: dict = {**WEB_TOOL_MAP, **STOCK_TOOL_MAP}
 
 
+class Memory:
+    """
+    Manages a windowed conversation history for the plain LlamaCpp chat path.
+
+    History is stored as a list of {"role": ..., "content": ...} dicts.
+
+    Args:
+        max_turns: Maximum number of *user/assistant turn pairs* to retain.
+                   Older turns are dropped once the limit is exceeded.
+                   The system prompt is always preserved.
+    """
+
+    def __init__(self, max_turns: int = 20):
+        self.max_turns = max_turns
+        self._messages: List[Dict[str, str]] = []
+
+    def add(self, role: str, content: str) -> None:
+        """Append a message and enforce the turn window."""
+        self._messages.append({"role": role, "content": content})
+        self._trim()
+
+    def get_history(self) -> List[Dict[str, str]]:
+        """Return a copy of current message history."""
+        return list(self._messages)
+
+    def clear(self) -> None:
+        """Wipe all history."""
+        self._messages.clear()
+
+    def _trim(self) -> None:
+        non_system = [m for m in self._messages if m["role"] != "system"]
+        max_messages = self.max_turns * 2
+
+        if len(non_system) > max_messages:
+            overflow = len(non_system) - max_messages
+            removed = 0
+            kept = []
+            for msg in self._messages:
+                if msg["role"] != "system" and removed < overflow:
+                    removed += 1
+                else:
+                    kept.append(msg)
+            self._messages = kept
+
+    def __len__(self) -> int:
+        return len(self._messages)
+
+    def __repr__(self) -> str:
+        return f"Memory(turns={len(self._messages)}, max_turns={self.max_turns})"
+
+
+class LlamaCpp:
+    """Client for llama.cpp server's chat completion API."""
+
+    def __init__(self, server_url: str = "http://localhost", port: int = 8080):
+        self.port = port
+        self.server_url = f"{server_url}:{port}"
+
+    def _extract_content(self, msg: dict) -> str:
+        """Extract text content from a message dict."""
+        return msg.get("content") or ""
+
+    def chat(self, messages: list[dict], tools: dict = None, tool_map: dict = None, **kwargs) -> str:
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+
+        payload = {
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", 2048),
+            "temperature": kwargs.get("temperature", 0.7),
+        }
+
+        if tools is not None:
+            payload["tools"] = tools
+
+        try:
+            response = requests.post(
+                f"{self.server_url}/v1/chat/completions",
+                json=payload,
+                timeout=120,
+            )
+            response.raise_for_status()
+            result = response.json()
+            msg = result["choices"][0]["message"]
+
+            if not msg.get("tool_calls"):
+                return self._extract_content(msg)
+
+            messages.append(msg)
+
+            max_iterations = 5
+            strip_tools_after = 3
+
+            for i in range(max_iterations):
+                for tool_call in msg["tool_calls"]:
+                    name = tool_call["function"]["name"]
+                    args = tool_call["function"]["arguments"]
+                    if isinstance(args, str):
+                        args = json.loads(args)
+
+                    print(f"🔧 Calling {name}({args})")
+                    if tool_map and name in tool_map:
+                        tool_result = tool_map[name].invoke(args)
+                    else:
+                        tool_result = f"Error: tool '{name}' not found"
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": str(tool_result),
+                    })
+
+                payload["messages"] = messages
+
+                if i >= strip_tools_after - 1:
+                    if "tools" in payload:
+                        payload.pop("tools")
+                        messages.append({
+                            "role": "user",
+                            "content": "Please provide your final answer based on the information gathered so far. Do not call any more tools.",
+                        })
+
+                response = requests.post(
+                    f"{self.server_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=120,
+                )
+                response.raise_for_status()
+                result = response.json()
+                msg = result["choices"][0]["message"]
+
+                if not msg.get("tool_calls"):
+                    return self._extract_content(msg)
+
+                messages.append(msg)
+
+            return self._extract_content(msg) or ""
+
+        except (requests.exceptions.RequestException, KeyError, json.JSONDecodeError) as e:
+            print(f"❌ Chat failed: {e}")
+            raise RuntimeError(f"Chat failed: {e}")
+
+
 # Global dictionary holding conversation memory per server config ID
 _memories: dict[str, Memory] = {}
 
 
-def get_memory(config_id: str) -> KHarnessMemory:
+def get_memory(config_id: str) -> Memory:
     """Get or create a conversation memory for a specific server."""
     if config_id not in _memories:
-        _memories[config_id] = KHarnessMemory(max_turns=20)
+        _memories[config_id] = Memory(max_turns=20)
     return _memories[config_id]
 
 
