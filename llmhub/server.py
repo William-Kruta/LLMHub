@@ -3,6 +3,8 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import requests as _requests
+
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -17,9 +19,64 @@ from .process_manager import process_manager
 UI_DIR = Path(__file__).parent.parent / "ui"
 
 
+def _probe_existing_servers() -> None:
+    """At startup, detect any llama.cpp servers already running at configured addresses.
+
+    Groups configs by (host, port) to avoid redundant HTTP calls. For each address
+    that responds to /health, fetches /props to read the running model path and matches
+    it against configs by filename. If only one config maps to an address and /props is
+    unavailable, that config is adopted without model verification.
+    """
+    configs = config_manager.list_configs()
+    if not configs:
+        return
+
+    # Group by address so we probe each (host, port) only once
+    by_address: dict[tuple[str, int], list] = {}
+    for config in configs:
+        by_address.setdefault((config.host, config.port), []).append(config)
+
+    for (host, port), group in by_address.items():
+        base_url = f"http://{host}:{port}"
+
+        # Skip if any config on this address is already managed
+        if any(process_manager.is_running(c.id) for c in group):
+            continue
+
+        # Health check
+        try:
+            resp = _requests.get(f"{base_url}/health", timeout=2)
+            if resp.status_code != 200:
+                continue
+        except Exception:
+            continue
+
+        # Try to read the running model path from /props
+        running_model_name: str | None = None
+        try:
+            props = _requests.get(f"{base_url}/props", timeout=2).json()
+            model_path = props.get("model_path") or ""
+            if model_path:
+                running_model_name = Path(model_path).name
+        except Exception:
+            pass
+
+        if running_model_name is not None:
+            # Match by model filename
+            for config in group:
+                if Path(config.model_path).name == running_model_name:
+                    process_manager.adopt(config.id)
+                    break
+        elif len(group) == 1:
+            # Only one config at this address and /props unavailable — adopt it
+            process_manager.adopt(group[0].id)
+        # else: multiple configs, /props unavailable — cannot safely identify which one
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
+    _probe_existing_servers()
     yield
     # Stop all servers on shutdown
     process_manager.stop_all()
