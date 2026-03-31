@@ -195,7 +195,7 @@ def chat_completion(config_id: str, request: ChatRequest):
 def clear_chat(config_id: str):
     """Clear the conversation memory for a server (both plain and agent)."""
     chat.clear_memory(config_id)
-    chat.clear_kharness_agent(config_id)
+    chat.clear_kharness_agents_for_server(config_id)
     return {"status": "cleared"}
 
 
