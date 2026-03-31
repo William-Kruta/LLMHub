@@ -854,8 +854,8 @@ function showConfirm(title, message, onConfirm) {
     overlay.className = 'confirm-overlay';
     overlay.innerHTML = `
         <div class="confirm-dialog">
-            <h3>${title}</h3>
-            <p>${message}</p>
+            <h3>${escapeHtml(title)}</h3>
+            <p>${escapeHtml(message)}</p>
             <div class="confirm-actions">
                 <button class="btn btn-ghost btn-sm confirm-cancel">Cancel</button>
                 <button class="btn btn-danger btn-sm confirm-ok">Delete</button>

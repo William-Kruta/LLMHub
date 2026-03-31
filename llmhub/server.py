@@ -233,11 +233,11 @@ def get_agent(agent_id: str) -> AgentConfig:
 @app.put("/api/agents/{agent_id}")
 def update_agent(agent_id: str, data: AgentConfigUpdate) -> AgentConfig:
     """Update an existing agent configuration."""
-    # Invalidate cached KHarness agent so it rebuilds with new config
-    chat.clear_kharness_agent(agent_id)
     agent = agent_manager.update_agent(agent_id, data)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    # Invalidate cached KHarness agent after confirmed write
+    chat.clear_kharness_agent(agent_id)
     return agent
 
 
