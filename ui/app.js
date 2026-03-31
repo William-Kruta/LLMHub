@@ -578,7 +578,7 @@ async function pollTerminalOutput() {
 
 // ── Chat Page ──────────────────────────────────────────
 let currentChatServerId = null;
-let chatAgentMode = false;
+let currentChatAgentId = null;
 
 function renderChatPage() {
     const header = `
@@ -591,13 +591,10 @@ function renderChatPage() {
                 <option value="" disabled selected>Select a running server...</option>
                 ${servers.filter(s => s.running).map(s => `<option value="${s.config.id}">${escapeHtml(s.config.name)}</option>`).join('')}
             </select>
-            <button class="btn btn-ghost btn-sm agent-toggle-btn ${chatAgentMode ? 'agent-active' : ''}" id="chat-agent-toggle" title="Toggle KHarness Agent mode">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="3"></circle>
-                    <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"></path>
-                </svg>
-                Agent${chatAgentMode ? ' ON' : ' OFF'}
-            </button>
+            <select class="chat-selector" id="chat-agent-select" style="max-width: 200px;">
+                <option value="">No agent (direct)</option>
+                ${agents.map(a => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('')}
+            </select>
             <button class="btn btn-ghost btn-sm" id="chat-clear-btn" disabled>Clear Chat</button>
         </div>`;
 
@@ -641,25 +638,12 @@ function renderChatPage() {
 
 function bindChatEvents() {
     const select = document.getElementById('chat-server-select');
+    const agentSelect = document.getElementById('chat-agent-select');
     const input = document.getElementById('chat-input');
     const sendBtn = document.getElementById('chat-send-btn');
     const clearBtn = document.getElementById('chat-clear-btn');
-    const agentToggle = document.getElementById('chat-agent-toggle');
 
     if (!select) return;
-
-    agentToggle?.addEventListener('click', () => {
-        chatAgentMode = !chatAgentMode;
-        agentToggle.textContent = '';
-        agentToggle.innerHTML = `
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="3"></circle>
-                <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"></path>
-            </svg>
-            Agent${chatAgentMode ? ' ON' : ' OFF'}`;
-        agentToggle.classList.toggle('agent-active', chatAgentMode);
-        showToast(`KHarness Agent mode ${chatAgentMode ? 'enabled' : 'disabled'}`, 'info');
-    });
 
     select.addEventListener('change', (e) => {
         currentChatServerId = e.target.value;
@@ -673,6 +657,10 @@ function bindChatEvents() {
             history.innerHTML = '<div class="terminal-empty">Start a conversation...</div>';
             input.focus();
         }
+    });
+
+    agentSelect?.addEventListener('change', (e) => {
+        currentChatAgentId = e.target.value || null;
     });
 
     clearBtn?.addEventListener('click', async () => {
@@ -691,15 +679,13 @@ function bindChatEvents() {
 
         const text = input.value.trim();
         input.value = '';
-        input.style.height = '48px'; // Reset height
+        input.style.height = '48px';
 
         const history = document.getElementById('chat-history');
 
-        // Remove empty state
         const empty = history.querySelector('.terminal-empty');
         if (empty) empty.remove();
 
-        // Append user message
         history.insertAdjacentHTML('beforeend', `
             <div class="chat-message user">
                 <div class="chat-role">You</div>
@@ -708,7 +694,6 @@ function bindChatEvents() {
         `);
         history.scrollTop = history.scrollHeight;
 
-        // Show thinking indicator
         const thinkingId = 'thinking-' + Date.now();
         history.insertAdjacentHTML('beforeend', `
             <div class="chat-thinking" id="${thinkingId}">
@@ -718,7 +703,6 @@ function bindChatEvents() {
         `);
         history.scrollTop = history.scrollHeight;
 
-        // Disable input
         input.disabled = true;
         sendBtn.disabled = true;
 
@@ -727,13 +711,11 @@ function bindChatEvents() {
                 message: text,
                 temperature: 0.7,
                 max_tokens: 2048,
-                use_agent: chatAgentMode,
+                agent_id: currentChatAgentId,
             });
 
-            // Remove thinking
             document.getElementById(thinkingId)?.remove();
 
-            // Append assistant message
             history.insertAdjacentHTML('beforeend', `
                 <div class="chat-message assistant">
                     <div class="chat-role">Assistant</div>
@@ -741,7 +723,6 @@ function bindChatEvents() {
                 </div>
             `);
         } catch (e) {
-            // Remove thinking
             document.getElementById(thinkingId)?.remove();
             showToast('Chat failed: ' + e.message, 'error');
         } finally {
@@ -761,7 +742,6 @@ function bindChatEvents() {
         }
     });
 
-    // Auto-resize textarea
     input?.addEventListener('input', function () {
         this.style.height = '48px';
         this.style.height = (this.scrollHeight) + 'px';
