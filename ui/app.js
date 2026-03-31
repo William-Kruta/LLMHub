@@ -830,6 +830,126 @@ function relativeTime(isoString) {
     return Math.floor(hrs / 24) + 'd ago';
 }
 
+function renderPhaseUpdate(text) {
+    const panel = document.getElementById('task-right-panel');
+    if (!panel) return;
+    // On first phase, clear the empty state
+    if (panel.querySelector('.task-empty-state') || panel.querySelector('.task-report')) {
+        panel.innerHTML = '<div class="task-phases"></div>';
+    }
+    const phases = panel.querySelector('.task-phases');
+    if (!phases) return;
+    const line = document.createElement('div');
+    line.className = 'task-phase-line';
+    line.textContent = text;
+    phases.appendChild(line);
+    panel.scrollTop = panel.scrollHeight;
+}
+
+function renderReport(markdown) {
+    const panel = document.getElementById('task-right-panel');
+    if (!panel) return;
+    panel.innerHTML = `<div class="task-report">${marked.parse(markdown)}</div>`;
+}
+
+async function runTask() {
+    const serverSelect = document.getElementById('task-server-select');
+    const agentSelect = document.getElementById('task-agent-select');
+    const fileInput = document.getElementById('task-file-input');
+    const runBtn = document.getElementById('task-run-btn');
+
+    const configId = serverSelect?.value;
+    const agentId = agentSelect?.value;
+    const file = fileInput?.files[0];
+
+    if (!configId) { showToast('Select a server', 'error'); return; }
+    if (!agentId) { showToast('Select an agent', 'error'); return; }
+    if (!file) { showToast('Choose a .md file', 'error'); return; }
+
+    runBtn.disabled = true;
+    runBtn.textContent = 'Running\u2026';
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('agent_id', agentId);
+    formData.append('config_id', configId);
+
+    let runId;
+    try {
+        const res = await fetch(`${API_BASE}/tasks/run`, { method: 'POST', body: formData });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(err.detail || 'Failed to start task');
+        }
+        const data = await res.json();
+        runId = data.run_id;
+    } catch (e) {
+        showToast('Failed to start task: ' + e.message, 'error');
+        runBtn.disabled = false;
+        runBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg> Run Task';
+        return;
+    }
+
+    currentRunId = runId;
+
+    const evtSource = new EventSource(`${API_BASE}/tasks/${runId}/stream`);
+
+    evtSource.onmessage = (e) => {
+        const event = JSON.parse(e.data);
+        if (event.type === 'phase') {
+            renderPhaseUpdate(event.text);
+        } else if (event.type === 'complete') {
+            evtSource.close();
+            renderReport(event.report);
+            runBtn.disabled = false;
+            runBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg> Run Task';
+            fetchTaskHistory().then(() => {
+                const histSec = document.querySelector('.task-history-section');
+                if (histSec) histSec.outerHTML = renderHistorySection();
+            });
+        } else if (event.type === 'error') {
+            evtSource.close();
+            showToast('Task error: ' + event.message, 'error');
+            runBtn.disabled = false;
+            runBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg> Run Task';
+        }
+    };
+
+    evtSource.onerror = () => {
+        evtSource.close();
+        showToast('Connection to task stream lost', 'error');
+        runBtn.disabled = false;
+        runBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg> Run Task';
+    };
+}
+
+function renderHistorySection() {
+    if (!taskHistory.length) return '';
+    const items = taskHistory.map(r => {
+        const agentName = agents.find(a => a.id === r.agent_id)?.name || r.agent_id;
+        const ago = relativeTime(r.completed_at || r.started_at);
+        return `<div class="task-history-item" data-report="${escapeHtml(r.report || '')}" data-filename="${escapeHtml(r.filename)}">
+            <span class="task-history-name">${escapeHtml(r.filename)}</span>
+            <span class="task-history-meta">${escapeHtml(agentName)} &middot; ${ago}</span>
+        </div>`;
+    }).join('');
+    return `<div class="task-history-section">
+        <div class="task-history-label">History</div>
+        ${items}
+    </div>`;
+}
+
+function bindTaskEvents() {
+    document.getElementById('task-run-btn')?.addEventListener('click', runTask);
+
+    document.querySelectorAll('.task-history-item').forEach(el => {
+        el.addEventListener('click', () => {
+            const report = el.dataset.report;
+            if (report) renderReport(report);
+        });
+    });
+}
+
 // ── Modal ──────────────────────────────────────────────
 function openModal(config = null) {
     const modal = document.getElementById('config-modal');
