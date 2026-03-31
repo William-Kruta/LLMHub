@@ -8,6 +8,7 @@ import requests
 from kharness.providers import LlamaCpp as KHarnessLlamaCpp
 from kharness.agent import Agent as KHarnessAgentBase
 from kharness.memory import Memory as KHarnessMemory
+from kharness.memory import Memory
 from kharness.tools import WEB_TOOL_MAP, STOCK_TOOL_MAP
 
 # All tools available for agent construction, keyed by individual tool name
@@ -15,7 +16,7 @@ _ALL_TOOLS: dict = {**WEB_TOOL_MAP, **STOCK_TOOL_MAP}
 
 
 # Global dictionary holding conversation memory per server config ID
-_memories: dict[str, KHarnessMemory] = {}
+_memories: dict[str, Memory] = {}
 
 
 def get_memory(config_id: str) -> KHarnessMemory:
