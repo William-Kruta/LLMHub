@@ -3,14 +3,15 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
-from .models import ServerConfigCreate, ServerConfigUpdate, ServerStatus, ChatRequest, AgentConfig, AgentConfigCreate, AgentConfigUpdate
+from .models import ServerConfigCreate, ServerConfigUpdate, ServerStatus, ChatRequest, AgentConfig, AgentConfigCreate, AgentConfigUpdate, TaskResult
 from . import config_manager
 from . import agent_manager
 from . import chat
+from . import task_runner
 from .process_manager import process_manager
 
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -248,6 +249,59 @@ def delete_agent(agent_id: str):
     chat.clear_kharness_agent(agent_id)
     if not agent_manager.delete_agent(agent_id):
         raise HTTPException(status_code=404, detail="Agent not found")
+
+
+# ── Tasks API ───────────────────────────────────────────
+
+
+@app.post("/api/tasks/run")
+async def run_task(
+    file: UploadFile,
+    agent_id: str = Form(...),
+    config_id: str = Form(...),
+):
+    """Start a research task. Returns a run_id for SSE streaming."""
+    agent_config = agent_manager.get_agent(agent_id)
+    if not agent_config:
+        raise HTTPException(status_code=400, detail="Agent not found")
+
+    config = config_manager.get_config(config_id)
+    if not config:
+        raise HTTPException(status_code=400, detail="Config not found")
+
+    if not process_manager.is_running(config_id):
+        raise HTTPException(status_code=400, detail="Server is not running")
+
+    instructions = (await file.read()).decode("utf-8")
+    filename = file.filename or "task.md"
+    server_url = "http://" + config.host
+
+    run_id = task_runner.start_run(
+        instructions=instructions,
+        filename=filename,
+        agent_id=agent_id,
+        config_id=config_id,
+        server_url=server_url,
+        port=config.port,
+        tool_names=agent_config.tools,
+        soul_md_path=agent_config.soul_md_path,
+    )
+    return {"run_id": run_id}
+
+
+@app.get("/api/tasks/history")
+def get_task_history() -> list[TaskResult]:
+    """Return completed task results, newest first."""
+    return task_runner.load_history()
+
+
+@app.get("/api/tasks/{run_id}/stream")
+def stream_task(run_id: str):
+    """SSE stream for a running task. Yields phase/complete/error events."""
+    return StreamingResponse(
+        task_runner.stream_run(run_id),
+        media_type="text/event-stream",
+    )
 
 
 # ── Static Files & SPA ──────────────────────────────────────────────────
