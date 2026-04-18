@@ -72,6 +72,9 @@ class ProcessManager:
         if config.cont_batching:
             cmd.append("--cont-batching")
 
+        if config.mmproj_path.strip():
+            cmd.extend(["--mmproj", config.mmproj_path.strip()])
+
         if config.extra_args.strip():
             cmd.extend(shlex.split(config.extra_args))
 

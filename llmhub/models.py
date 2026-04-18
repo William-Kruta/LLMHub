@@ -18,6 +18,7 @@ class ServerConfig(BaseModel):
     parallel: int = Field(default=1, description="Concurrent request slots")
     cont_batching: bool = Field(default=True, description="Enable continuous batching")
     extra_args: str = Field(default="", description="Additional CLI flags (freeform)")
+    mmproj_path: str = Field(default="", description="Path to a multimodal projector (.mmproj) file")
 
 
 class ServerConfigCreate(BaseModel):
@@ -33,6 +34,7 @@ class ServerConfigCreate(BaseModel):
     parallel: int = 1
     cont_batching: bool = True
     extra_args: str = ""
+    mmproj_path: str = ""
 
 
 class ServerConfigUpdate(BaseModel):
@@ -48,6 +50,7 @@ class ServerConfigUpdate(BaseModel):
     parallel: int | None = None
     cont_batching: bool | None = None
     extra_args: str | None = None
+    mmproj_path: str | None = None
 
 
 class ServerStatus(BaseModel):

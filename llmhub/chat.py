@@ -5,10 +5,10 @@ from typing import List, Dict
 
 import requests
 
-from kharness.providers import LlamaCpp as KHarnessLlamaCpp
-from kharness.agent import Agent as KHarnessAgentBase
-from kharness.memory import Memory as KHarnessMemory
-from kharness.tools import WEB_TOOL_MAP, STOCK_TOOL_MAP
+from .harness.providers import LlamaCpp as KHarnessLlamaCpp
+from .harness.agent import Agent as KHarnessAgentBase
+from .harness.memory import Memory as KHarnessMemory
+from .harness.tools import WEB_TOOL_MAP, STOCK_TOOL_MAP
 
 # All tools available for agent construction, keyed by individual tool name
 _ALL_TOOLS: dict = {**WEB_TOOL_MAP, **STOCK_TOOL_MAP}

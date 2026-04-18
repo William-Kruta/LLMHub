@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.claude
+.codex 
+
+llmhub/agents.json
+llmhub/config.json
+llmhub/task_results.json

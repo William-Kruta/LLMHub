@@ -969,6 +969,7 @@ function openModal(config = null) {
     document.getElementById('config-threads').value = config?.threads || 4;
     document.getElementById('config-parallel').value = config?.parallel || 1;
     document.getElementById('config-cont-batching').checked = config?.cont_batching ?? true;
+    document.getElementById('config-mmproj-path').value = config?.mmproj_path || '';
     document.getElementById('config-extra-args').value = config?.extra_args || '';
 
     modal.classList.add('open');
@@ -998,6 +999,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
         threads: parseInt(document.getElementById('config-threads').value),
         parallel: parseInt(document.getElementById('config-parallel').value),
         cont_batching: document.getElementById('config-cont-batching').checked,
+        mmproj_path: document.getElementById('config-mmproj-path').value,
         extra_args: document.getElementById('config-extra-args').value,
     };
 
