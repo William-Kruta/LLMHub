@@ -1,4 +1,3 @@
 uvicorn[standard]
 requests
 fastapi
-kharness
