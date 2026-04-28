@@ -89,6 +89,21 @@ http://localhost:8005
 
 The included `run.sh` does the same thing for this local checkout after activating `.venv`.
 
+To install a shell alias so you can start the app with `hub`:
+
+```bash
+./alias.sh
+source ~/.bashrc
+```
+
+If you use zsh, source `~/.zshrc` instead. The installer detects bash/zsh from `$SHELL`, updates the matching rc file, and replaces its own managed alias block if you run it again.
+
+You can choose a different alias name by passing it as the first argument:
+
+```bash
+./alias.sh llmhub
+```
+
 ## Basic Workflow
 
 1. Open `http://localhost:8005`.
