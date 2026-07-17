@@ -2,22 +2,25 @@
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+import json
 from pathlib import Path
 import socket
 import time
 
 import requests as _requests
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
-from .models import AppSettings, BenchmarkResult, EndpointTestResult, GPUStatus, LogAnnotation, ModelScanResult, PortSuggestion, Preset, RAMStatus, ServerConfig, ServerConfigCreate, ServerConfigUpdate, ServerStatus
+from .models import AppSettings, BenchmarkResult, EndpointTestResult, GPUStatus, LogAnnotation, ModelScanResult, PortSuggestion, Preset, RAMStatus, ServerConfig, ServerConfigCreate, ServerConfigUpdate, ServerStatus, TokenUsage
 from . import config_manager
 from . import gpu_monitor
 from . import ram_monitor
 from . import settings_manager
+from . import token_tracker
 from .process_manager import process_manager
 
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -120,7 +123,7 @@ def _health_for(config: ServerConfig, running: bool) -> tuple[str, str | None]:
     return "unreachable", f"Health endpoint returned HTTP {resp.status_code}"
 
 
-def _status_for(config: ServerConfig) -> ServerStatus:
+def _status_for(config: ServerConfig, token_usage: TokenUsage | None = None) -> ServerStatus:
     """Build the API status object for one config."""
     running = process_manager.is_running(config.id)
     health, detail = _health_for(config, running)
@@ -146,6 +149,7 @@ def _status_for(config: ServerConfig) -> ServerStatus:
         model_size_label=_file_size_label(_file_size(config.model_path)),
         validation_warnings=_validation_warnings(config),
         resource_hints=_resource_hints(config),
+        token_usage=token_usage if token_usage is not None else token_tracker.get_usage(config.id),
     )
 
 
@@ -265,6 +269,29 @@ def _parse_import_payload(payload: dict | list) -> tuple[list[ServerConfig | Ser
     return configs, replace
 
 
+def _forward_headers(request: Request) -> dict[str, str]:
+    """Forward request headers that are useful to the llama.cpp endpoint."""
+    skip = {"host", "content-length", "connection", "accept-encoding"}
+    return {key: value for key, value in request.headers.items() if key.lower() not in skip}
+
+
+def _target_url(config: ServerConfig, path: str, query: str) -> str:
+    url = f"http://{config.host}:{config.port}{path}"
+    return f"{url}?{query}" if query else url
+
+
+def _response_media_type(resp) -> str | None:
+    content_type = resp.headers.get("content-type") if hasattr(resp, "headers") else None
+    return content_type.split(";", 1)[0].strip() if content_type else None
+
+
+def _record_usage_from_response(config_id: str, resp) -> None:
+    try:
+        token_tracker.record_response_usage(config_id, resp.json())
+    except Exception:
+        pass
+
+
 @app.get("/api/configs")
 def list_configs() -> list[ServerStatus]:
     """List all configs with their runtime status."""
@@ -273,7 +300,8 @@ def list_configs() -> list[ServerStatus]:
         key=lambda c: c.last_used_at or c.updated_at or c.created_at or "",
         reverse=True,
     )
-    return [_status_for(c) for c in configs]
+    all_usage = token_tracker.get_all_usage()
+    return [_status_for(c, token_usage=all_usage.get(c.id, TokenUsage())) for c in configs]
 
 
 @app.post("/api/configs", status_code=201)
@@ -366,7 +394,12 @@ def export_configs():
 def import_configs(payload: dict | list = Body(...)) -> list[ServerStatus]:
     """Import saved server configurations."""
     configs, replace = _parse_import_payload(payload)
+    previous_ids = {c.id for c in config_manager.list_configs()} if replace else set()
     imported = config_manager.import_configs(configs, replace=replace)
+    if previous_ids:
+        # Replace-imports destroy the previous configs, so drop their usage
+        # counters like a delete would — even for re-imported ids.
+        token_tracker.reset_many(previous_ids)
     return [_status_for(config) for config in imported]
 
 
@@ -421,6 +454,10 @@ def delete_config(config_id: str):
         )
     if not config_manager.delete_config(config_id):
         raise HTTPException(status_code=404, detail="Config not found")
+    try:
+        token_tracker.reset_usage(config_id)
+    except Exception:
+        pass  # the delete already succeeded; counter cleanup is best-effort
 
 
 @app.post("/api/configs/{config_id}/start")
@@ -521,6 +558,110 @@ def get_command(config_id: str):
     }
 
 
+@app.get("/api/configs/{config_id}/tokens")
+def get_token_usage(config_id: str):
+    """Return aggregate token usage for a config."""
+    if not config_manager.get_config(config_id):
+        raise HTTPException(status_code=404, detail="Config not found")
+    return token_tracker.get_usage(config_id)
+
+
+@app.post("/api/configs/{config_id}/tokens/reset")
+def reset_token_usage(config_id: str):
+    """Reset aggregate token usage for a config."""
+    if not config_manager.get_config(config_id):
+        raise HTTPException(status_code=404, detail="Config not found")
+    return token_tracker.reset_usage(config_id)
+
+
+def _record_stream_usage(config_id: str, tail: bytes) -> None:
+    """Record usage from the final SSE data chunk of a streamed response."""
+    try:
+        for line in reversed(tail.decode("utf-8", errors="replace").splitlines()):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("usage"), dict):
+                token_tracker.record_response_usage(config_id, parsed)
+                return
+    except Exception:
+        pass
+
+
+def _stream_and_record(config_id: str, resp):
+    """Forward streamed bytes, retaining the tail to capture the final usage chunk."""
+    tail = b""
+    ok = resp.ok
+    try:
+        for chunk in resp.iter_content(chunk_size=None):
+            if not chunk:
+                continue
+            tail = (tail + chunk)[-65536:]
+            yield chunk
+    finally:
+        resp.close()
+        if ok:
+            _record_stream_usage(config_id, tail)
+
+
+@app.api_route("/api/configs/{config_id}/v1/{v1_path:path}", methods=["GET", "POST"])
+async def proxy_v1(config_id: str, v1_path: str, request: Request):
+    """Proxy OpenAI-compatible requests through LLM Hub so token usage can be tracked."""
+    config = config_manager.get_config(config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found")
+
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except ValueError:
+        payload = {}
+    stream = bool(payload.get("stream")) if isinstance(payload, dict) else False
+
+    target = _target_url(config, f"/v1/{v1_path}", request.url.query)
+    headers = _forward_headers(request)
+
+    def forward():
+        # Generations can legitimately take minutes, so only the connect phase
+        # is bounded; the threadpool keeps the wait off the event loop.
+        return _requests.request(
+            request.method,
+            target,
+            data=body or None,
+            headers=headers,
+            stream=stream,
+            timeout=(10, None),
+        )
+
+    try:
+        resp = await run_in_threadpool(forward)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if stream:
+        return StreamingResponse(
+            _stream_and_record(config_id, resp),
+            status_code=resp.status_code,
+            media_type=_response_media_type(resp) or "text/event-stream",
+        )
+
+    if resp.ok:
+        _record_usage_from_response(config_id, resp)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=_response_media_type(resp),
+    )
+
+
 @app.post("/api/configs/{config_id}/benchmark")
 def benchmark_endpoint(config_id: str) -> BenchmarkResult:
     """Run a tiny benchmark request against a healthy OpenAI-compatible endpoint."""
@@ -540,6 +681,7 @@ def benchmark_endpoint(config_id: str) -> BenchmarkResult:
         if not resp.ok:
             return BenchmarkResult(ok=False, detail=resp.text[:500], latency_ms=latency_ms)
         data = resp.json()
+        _record_usage_from_response(config_id, resp)
         usage = data.get("usage") or {}
         completion_tokens = usage.get("completion_tokens")
         tokens_per_second = None

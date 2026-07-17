@@ -164,6 +164,16 @@ class ServerConfigUpdate(BaseModel):
         return ServerConfigCreate.validate_env_vars(value)
 
 
+class TokenUsage(BaseModel):
+    """Aggregated token usage for one server configuration."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    request_count: int = 0
+    last_used_at: str | None = None
+
+
 class ServerStatus(BaseModel):
     """Runtime status of a server."""
 
@@ -186,6 +196,7 @@ class ServerStatus(BaseModel):
     model_size_label: str | None = None
     validation_warnings: list[str] = Field(default_factory=list)
     resource_hints: list[str] = Field(default_factory=list)
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
 class ConfigImportPayload(BaseModel):

@@ -15,3 +15,4 @@ llmhub/agents.json
 llmhub/config.json
 llmhub/settings.json
 llmhub/task_results.json
+llmhub/token_usage.json

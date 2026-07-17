@@ -24,6 +24,9 @@ LLM Hub is a local web interface for configuring and managing `llama.cpp` model 
 - Exports individual configs and imports either one config, an array, or a wrapped `{configs: [...]}` export.
 - Tests the OpenAI-compatible `/v1/models` endpoint for a running config.
 - Runs a quick `/v1/chat/completions` benchmark for configured endpoints.
+- Tracks input and output token totals per config for benchmarks and requests sent through LLM Hub's OpenAI-compatible proxy routes.
+- Estimates per-config token spend from tracked usage and user-supplied input/output prices.
+- Provides a lightweight chat page for sending test messages to a selected config.
 - Shows best-effort system RAM telemetry and GPU telemetry from `nvidia-smi` or `rocm-smi` when available.
 - Streams, filters, annotates, copies, downloads, and clears retained stdout/stderr from managed server processes.
 
@@ -128,6 +131,12 @@ App settings are stored in:
 llmhub/settings.json
 ```
 
+Token usage counters are stored in:
+
+```text
+llmhub/token_usage.json
+```
+
 Set `LLMHUB_DATA_DIR` to store runtime config outside the package directory:
 
 ```bash
@@ -135,6 +144,7 @@ LLMHUB_DATA_DIR=/path/to/llmhub-data python main.py
 ```
 
 When `LLMHUB_DATA_DIR` is set, both `config.json` and `settings.json` are written in that directory instead of under `llmhub/`.
+Token usage is also written there as `token_usage.json`.
 
 Each config includes:
 
@@ -183,8 +193,13 @@ LLM Hub exposes a small JSON API under `/api`:
 - `POST /api/configs/{config_id}/output/clear`
 - `GET /api/configs/{config_id}/logs`
 - `GET /api/configs/{config_id}/command`
+- `GET /api/configs/{config_id}/tokens`
+- `POST /api/configs/{config_id}/tokens/reset`
+- `GET|POST /api/configs/{config_id}/v1/{path}` (OpenAI-compatible proxy, including `/v1/chat/completions`, `/v1/completions`, and `/v1/models`)
 - `POST /api/configs/{config_id}/benchmark`
 - `POST /api/configs/{config_id}/test`
+
+Token tracking is exact when the proxied llama.cpp response includes the standard OpenAI-compatible `usage` object. Streamed responses are counted when the final stream chunk carries a `usage` object (llama.cpp includes it when clients request `stream_options: {"include_usage": true}`). Direct calls to the raw llama-server URL bypass LLM Hub and are not counted.
 
 ## Development
 

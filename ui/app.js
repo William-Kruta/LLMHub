@@ -18,9 +18,27 @@ let hubStateFilter = 'all';
 let modelPathOptions = [];
 let modelPathOptionsDirectory = '';
 let modelPathActiveIndex = -1;
+let tokenCalculatorConfigId = '';
+let tokenCalculatorInputPrice = '';
+let tokenCalculatorOutputPrice = '';
+let tokenCalculatorMagnitude = '1000000';
+let chatConfigId = '';
+let chatMessagesByConfig = {};
+let chatSending = false;
+let chatRequestSettings = {
+    maxTokens: '512',
+    temperature: '0.7',
+    topP: '0.95',
+    presencePenalty: '0',
+    frequencyPenalty: '0',
+    seed: '',
+    systemPrompt: '',
+    stopSequences: '',
+    includeHistory: true,
+};
 
 function navigate(page) {
-    currentPage = ['hub', 'configs', 'terminal', 'settings'].includes(page) ? page : 'hub';
+    currentPage = ['hub', 'configs', 'terminal', 'chat', 'token-calculator', 'settings'].includes(page) ? page : 'hub';
     document.querySelectorAll('.nav-item').forEach(el => {
         el.classList.toggle('active', el.dataset.page === currentPage);
     });
@@ -133,6 +151,14 @@ async function render() {
     } else if (currentPage === 'terminal') {
         main.innerHTML = renderTerminalPage();
         bindTerminalEvents();
+    } else if (currentPage === 'chat') {
+        stopTerminalPoller();
+        main.innerHTML = renderChatPage();
+        bindChatEvents();
+    } else if (currentPage === 'token-calculator') {
+        stopTerminalPoller();
+        main.innerHTML = renderTokenCalculatorPage();
+        bindTokenCalculatorEvents();
     } else if (currentPage === 'settings') {
         stopTerminalPoller();
         main.innerHTML = renderSettingsPage();
@@ -323,6 +349,7 @@ function renderServerCard(s) {
     const showRecent = s.running && recent.length > 0 && health !== 'healthy';
     const warnings = s.validation_warnings || [];
     const startup = s.startup_elapsed_seconds != null ? `${s.startup_elapsed_seconds}s` : 'n/a';
+    const usage = tokenUsage(s);
 
     return `
         <div class="server-card ${health}" data-id="${c.id}">
@@ -356,6 +383,14 @@ function renderServerCard(s) {
                 <div class="card-detail">
                     <span class="label">Startup</span>
                     <span class="value">${startup}</span>
+                </div>
+                <div class="card-detail">
+                    <span class="label">Input</span>
+                    <span class="value">${formatTokens(usage.prompt_tokens)}</span>
+                </div>
+                <div class="card-detail">
+                    <span class="label">Output</span>
+                    <span class="value">${formatTokens(usage.completion_tokens)}</span>
                 </div>
             </div>
             ${warnings.length ? `<div class="card-warning">${escapeHtml(warnings[0])}</div>` : ''}
@@ -651,6 +686,7 @@ function showDetails(configId) {
     const server = servers.find(s => s.config.id === configId);
     if (!server) return;
     const c = server.config;
+    const usage = tokenUsage(server);
     const overlay = document.createElement('div');
     overlay.className = 'confirm-overlay';
     overlay.innerHTML = `
@@ -663,17 +699,36 @@ function showDetails(configId) {
                 <dt>Preset</dt><dd>${escapeHtml(c.preset || 'custom')}</dd>
                 <dt>Health</dt><dd>${escapeHtml(labelForHealth(server.health))}${server.status_detail ? ` - ${escapeHtml(server.status_detail)}` : ''}</dd>
                 <dt>Startup</dt><dd>${server.startup_elapsed_seconds ?? 'n/a'} seconds</dd>
+                <dt>Input tokens</dt><dd>${formatTokens(usage.prompt_tokens)}</dd>
+                <dt>Output tokens</dt><dd>${formatTokens(usage.completion_tokens)}</dd>
+                <dt>Total tokens</dt><dd>${formatTokens(usage.total_tokens)}</dd>
+                <dt>Tracked requests</dt><dd>${usage.request_count.toLocaleString()}</dd>
+                <dt>Last token use</dt><dd>${escapeHtml(relativeTime(usage.last_used_at))}</dd>
+                <dt>Chat proxy</dt><dd>${escapeHtml(trackedChatUrl(c))}</dd>
                 <dt>Last exit</dt><dd>${server.last_exit_code ?? 'n/a'} ${server.failure_summary ? `- ${escapeHtml(server.failure_summary)}` : ''}</dd>
                 <dt>Warnings</dt><dd>${escapeHtml((server.validation_warnings || []).join('; ') || 'None')}</dd>
                 <dt>Resource hints</dt><dd>${escapeHtml((server.resource_hints || []).join('; ') || 'None')}</dd>
                 <dt>Command</dt><dd>${escapeHtml(server.command_text)}</dd>
             </dl>
             <div class="confirm-actions">
+                <button class="btn btn-ghost btn-sm copy-token-url-btn">Copy Proxy URL</button>
+                <button class="btn btn-danger btn-sm reset-token-usage-btn">Reset Tokens</button>
                 <button class="btn btn-ghost btn-sm confirm-cancel">Close</button>
             </div>
         </div>`;
     document.body.appendChild(overlay);
     overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('.copy-token-url-btn').addEventListener('click', () => copyText(trackedChatUrl(c), 'Proxy URL copied'));
+    overlay.querySelector('.reset-token-usage-btn').addEventListener('click', async () => {
+        try {
+            await apiPost(`/configs/${configId}/tokens/reset`);
+            overlay.remove();
+            showToast('Token usage reset', 'info');
+            render();
+        } catch (e) {
+            showToast('Failed to reset token usage: ' + e.message, 'error');
+        }
+    });
     overlay.addEventListener('click', e => {
         if (e.target === overlay) overlay.remove();
     });
@@ -787,6 +842,435 @@ function bindTerminalEvents() {
 
     select.value = currentTerminalServerId || servers[0].config.id;
     switchTerminalServer(select.value);
+}
+
+function renderChatPage() {
+    const header = `
+        <div class="page-header">
+            <div>
+                <h1>Chat</h1>
+                <p class="subtitle">Send a quick test message to a configured model</p>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-ghost btn-icon" id="chat-settings-btn" title="Chat settings" aria-label="Chat settings">${gearIcon(18)}</button>
+            </div>
+        </div>`;
+
+    if (servers.length === 0) {
+        return header + `
+            <div class="empty-state">
+                <div class="empty-state-icon">${chatIcon(36)}</div>
+                <h3>No Configurations</h3>
+                <p>Create a server configuration first to test chat responses.</p>
+                <a href="#configs" class="btn btn-primary">Go to Configs</a>
+            </div>`;
+    }
+
+    if (!servers.some(s => s.config.id === chatConfigId)) {
+        chatConfigId = servers[0].config.id;
+    }
+
+    const server = chatServer();
+    const usage = tokenUsage(server);
+    const options = servers.map(s => `<option value="${s.config.id}" ${s.config.id === chatConfigId ? 'selected' : ''}>${escapeHtml(s.config.name)}</option>`).join('');
+    const messages = chatMessages();
+
+    return header + `
+        <section class="chat-panel">
+            <div class="chat-toolbar">
+                <select class="chat-server-select" id="chat-server-select">${options}</select>
+                <div class="terminal-status-badge ${server?.health || 'stopped'}">
+                    <span class="status-dot"></span> ${labelForHealth(server?.health || 'stopped')}
+                </div>
+                <div class="chat-token-summary">
+                    <span>Input ${formatTokens(usage.prompt_tokens)}</span>
+                    <span>Output ${formatTokens(usage.completion_tokens)}</span>
+                </div>
+                <button class="btn btn-ghost btn-sm" id="chat-clear-btn" ${messages.length ? '' : 'disabled'}>Clear</button>
+            </div>
+            <div class="chat-window" id="chat-window">
+                ${renderChatMessages(messages)}
+            </div>
+            <form class="chat-composer" id="chat-form">
+                <textarea id="chat-input" rows="3" placeholder="Message the selected model" ${chatSending ? 'disabled' : ''}></textarea>
+                <button class="btn btn-primary" id="chat-send-btn" type="submit" ${chatSending ? 'disabled' : ''}>${chatSending ? 'Sending...' : 'Send'}</button>
+            </form>
+        </section>`;
+}
+
+function bindChatEvents() {
+    document.getElementById('chat-settings-btn')?.addEventListener('click', openChatSettings);
+    document.getElementById('chat-server-select')?.addEventListener('change', e => {
+        chatConfigId = e.target.value;
+        render();
+    });
+    document.getElementById('chat-clear-btn')?.addEventListener('click', () => {
+        chatMessagesByConfig[chatConfigId] = [];
+        renderChatOnly();
+    });
+    document.getElementById('chat-form')?.addEventListener('submit', sendChatMessage);
+    document.getElementById('chat-input')?.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            document.getElementById('chat-form')?.requestSubmit();
+        }
+    });
+    scrollChatToBottom();
+}
+
+function renderChatMessages(messages) {
+    if (!messages.length) {
+        return `<div class="chat-empty">No messages yet</div>`;
+    }
+    return messages.map(message => `
+        <div class="chat-message ${message.role} ${message.error ? 'error' : ''}">
+            <div class="chat-bubble">
+                <div class="chat-role">${message.role === 'assistant' ? 'Model' : 'You'}</div>
+                <div class="chat-content">${escapeHtml(message.content)}</div>
+            </div>
+        </div>
+    `).join('');
+}
+
+async function sendChatMessage(event) {
+    event.preventDefault();
+    if (chatSending || !chatConfigId) return;
+
+    const input = document.getElementById('chat-input');
+    const content = input?.value.trim();
+    if (!content) return;
+
+    const messages = chatMessages();
+    messages.push({ role: 'user', content });
+    input.value = '';
+    chatSending = true;
+    renderChatOnly();
+
+    try {
+        const data = await apiPost(`/configs/${chatConfigId}/v1/chat/completions`, chatRequestPayload(messages));
+        const reply = extractChatReply(data);
+        messages.push({ role: 'assistant', content: reply.content, error: reply.error });
+        await fetchServers({ quiet: true });
+    } catch (e) {
+        messages.push({ role: 'assistant', content: `Request failed: ${e.message}`, error: true });
+    } finally {
+        chatSending = false;
+        renderChatOnly();
+    }
+}
+
+function renderChatOnly() {
+    const panel = document.querySelector('.chat-panel');
+    if (!panel) return;
+    const server = chatServer();
+    const usage = tokenUsage(server);
+    const messages = chatMessages();
+    panel.querySelector('.chat-token-summary').innerHTML = `
+        <span>Input ${formatTokens(usage.prompt_tokens)}</span>
+        <span>Output ${formatTokens(usage.completion_tokens)}</span>`;
+    panel.querySelector('#chat-window').innerHTML = renderChatMessages(messages);
+    panel.querySelector('#chat-clear-btn').disabled = messages.length === 0;
+    panel.querySelector('#chat-send-btn').disabled = chatSending;
+    panel.querySelector('#chat-send-btn').textContent = chatSending ? 'Sending...' : 'Send';
+    const input = panel.querySelector('#chat-input');
+    input.disabled = chatSending;
+    scrollChatToBottom();
+    if (!chatSending) input.focus();
+}
+
+function openChatSettings() {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+        <div class="confirm-dialog chat-settings-dialog">
+            <h3>Chat Settings</h3>
+            <form id="chat-settings-form">
+                <div class="form-grid compact-form-grid">
+                    <div class="form-group">
+                        <label for="chat-setting-max-tokens">Maximum Output Tokens</label>
+                        <input type="number" id="chat-setting-max-tokens" min="1" step="1" value="${escapeHtml(chatRequestSettings.maxTokens)}">
+                    </div>
+                    <div class="form-group">
+                        <label for="chat-setting-temperature">Temperature</label>
+                        <input type="number" id="chat-setting-temperature" min="0" max="2" step="0.01" value="${escapeHtml(chatRequestSettings.temperature)}">
+                    </div>
+                    <div class="form-group">
+                        <label for="chat-setting-top-p">Top P</label>
+                        <input type="number" id="chat-setting-top-p" min="0" max="1" step="0.01" value="${escapeHtml(chatRequestSettings.topP)}">
+                    </div>
+                    <div class="form-group">
+                        <label for="chat-setting-seed">Seed</label>
+                        <input type="number" id="chat-setting-seed" step="1" placeholder="Random" value="${escapeHtml(chatRequestSettings.seed)}">
+                    </div>
+                    <div class="form-group">
+                        <label for="chat-setting-presence">Presence Penalty</label>
+                        <input type="number" id="chat-setting-presence" min="-2" max="2" step="0.01" value="${escapeHtml(chatRequestSettings.presencePenalty)}">
+                    </div>
+                    <div class="form-group">
+                        <label for="chat-setting-frequency">Frequency Penalty</label>
+                        <input type="number" id="chat-setting-frequency" min="-2" max="2" step="0.01" value="${escapeHtml(chatRequestSettings.frequencyPenalty)}">
+                    </div>
+                    <div class="form-group full-width">
+                        <label for="chat-setting-system">System Prompt</label>
+                        <textarea id="chat-setting-system" rows="3" placeholder="Optional behavior instructions">${escapeHtml(chatRequestSettings.systemPrompt)}</textarea>
+                    </div>
+                    <div class="form-group full-width">
+                        <label for="chat-setting-stop">Stop Sequences</label>
+                        <textarea id="chat-setting-stop" rows="3" placeholder="One sequence per line">${escapeHtml(chatRequestSettings.stopSequences)}</textarea>
+                    </div>
+                    <div class="form-group full-width">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="chat-setting-history" ${chatRequestSettings.includeHistory ? 'checked' : ''}>
+                            <span class="checkmark"></span>
+                            Send prior chat messages with each request
+                        </label>
+                    </div>
+                </div>
+                <div class="confirm-actions">
+                    <button class="btn btn-ghost btn-sm confirm-cancel" type="button">Cancel</button>
+                    <button class="btn btn-primary btn-sm" type="submit">Save</button>
+                </div>
+            </form>
+        </div>`;
+
+    document.body.appendChild(overlay);
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('#chat-settings-form').addEventListener('submit', e => {
+        e.preventDefault();
+        chatRequestSettings = {
+            maxTokens: document.getElementById('chat-setting-max-tokens').value || '512',
+            temperature: document.getElementById('chat-setting-temperature').value || '0.7',
+            topP: document.getElementById('chat-setting-top-p').value || '0.95',
+            presencePenalty: document.getElementById('chat-setting-presence').value || '0',
+            frequencyPenalty: document.getElementById('chat-setting-frequency').value || '0',
+            seed: document.getElementById('chat-setting-seed').value,
+            systemPrompt: document.getElementById('chat-setting-system').value,
+            stopSequences: document.getElementById('chat-setting-stop').value,
+            includeHistory: document.getElementById('chat-setting-history').checked,
+        };
+        overlay.remove();
+        showToast('Chat settings saved', 'success');
+    });
+    overlay.addEventListener('click', e => {
+        if (e.target === overlay) overlay.remove();
+    });
+}
+
+function chatRequestPayload(messages) {
+    const cleanMessages = messages.filter(message => !message.error).map(({ role, content }) => ({ role, content }));
+    const requestMessages = chatRequestSettings.includeHistory
+        ? cleanMessages
+        : cleanMessages.slice(-1);
+    const systemPrompt = chatRequestSettings.systemPrompt.trim();
+    const payload = {
+        messages: systemPrompt ? [{ role: 'system', content: systemPrompt }, ...requestMessages] : requestMessages,
+    };
+
+    setNumericPayload(payload, 'max_tokens', chatRequestSettings.maxTokens, { integer: true, min: 1 });
+    setNumericPayload(payload, 'temperature', chatRequestSettings.temperature, { min: 0 });
+    setNumericPayload(payload, 'top_p', chatRequestSettings.topP, { min: 0, max: 1 });
+    setNumericPayload(payload, 'presence_penalty', chatRequestSettings.presencePenalty);
+    setNumericPayload(payload, 'frequency_penalty', chatRequestSettings.frequencyPenalty);
+    setNumericPayload(payload, 'seed', chatRequestSettings.seed, { integer: true });
+
+    const stop = linesFromText(chatRequestSettings.stopSequences);
+    if (stop.length === 1) payload.stop = stop[0];
+    if (stop.length > 1) payload.stop = stop;
+    return payload;
+}
+
+function setNumericPayload(payload, key, rawValue, { integer = false, min = null, max = null } = {}) {
+    if (String(rawValue ?? '').trim() === '') return;
+    let value = Number(rawValue);
+    if (!Number.isFinite(value)) return;
+    if (integer) value = Math.trunc(value);
+    if (min != null) value = Math.max(min, value);
+    if (max != null) value = Math.min(max, value);
+    payload[key] = value;
+}
+
+function linesFromText(value) {
+    return String(value || '').split('\n').map(line => line.trim()).filter(Boolean);
+}
+
+function extractChatReply(data) {
+    const choice = data?.choices?.[0] || {};
+    const message = choice.message || {};
+    const candidates = [
+        message.content,
+        message.reasoning_content,
+        message.reasoning,
+        choice.content,
+        choice.text,
+        choice.delta?.content,
+        data?.message?.content,
+        data?.content,
+        data?.response,
+        data?.text,
+    ];
+
+    for (const candidate of candidates) {
+        const text = contentToText(candidate);
+        if (text) return { content: text, error: false };
+    }
+
+    const preview = responsePreview(data);
+    return {
+        content: preview
+            ? `No assistant text found in the response.\n\n${preview}`
+            : 'No assistant text found in the response.',
+        error: true,
+    };
+}
+
+function contentToText(content) {
+    if (content == null) return '';
+    if (typeof content === 'string') return content.trim();
+    if (typeof content === 'number' || typeof content === 'boolean') return String(content);
+    if (Array.isArray(content)) {
+        return content.map(part => {
+            if (typeof part === 'string') return part;
+            if (!part || typeof part !== 'object') return '';
+            return part.text || part.content || part.value || '';
+        }).join('').trim();
+    }
+    if (typeof content === 'object') {
+        return content.text || content.content || content.value || '';
+    }
+    return '';
+}
+
+function responsePreview(data) {
+    try {
+        return JSON.stringify(data, null, 2).slice(0, 1200);
+    } catch {
+        return '';
+    }
+}
+
+function chatServer() {
+    return servers.find(s => s.config.id === chatConfigId) || servers[0] || null;
+}
+
+function chatMessages() {
+    if (!chatMessagesByConfig[chatConfigId]) {
+        chatMessagesByConfig[chatConfigId] = [];
+    }
+    return chatMessagesByConfig[chatConfigId];
+}
+
+function scrollChatToBottom() {
+    const win = document.getElementById('chat-window');
+    if (win) win.scrollTop = win.scrollHeight;
+}
+
+function renderTokenCalculatorPage() {
+    const header = `
+        <div class="page-header">
+            <div>
+                <h1>Token Calculator</h1>
+                <p class="subtitle">Estimate spend from tracked input and output token usage</p>
+            </div>
+        </div>`;
+
+    if (servers.length === 0) {
+        return header + `
+            <div class="empty-state">
+                <div class="empty-state-icon">${calculatorIcon(36)}</div>
+                <h3>No Configurations</h3>
+                <p>Create a server configuration first to calculate token spend.</p>
+                <a href="#configs" class="btn btn-primary">Go to Configs</a>
+            </div>`;
+    }
+
+    if (!servers.some(s => s.config.id === tokenCalculatorConfigId)) {
+        tokenCalculatorConfigId = servers[0].config.id;
+    }
+
+    const options = servers.map(s => `<option value="${s.config.id}" ${s.config.id === tokenCalculatorConfigId ? 'selected' : ''}>${escapeHtml(s.config.name)}</option>`).join('');
+    const selected = tokenCalculatorServer();
+    const usage = tokenUsage(selected);
+    const costs = tokenCalculatorCosts();
+
+    return header + `
+        <section class="calculator-panel">
+            <div class="calculator-controls">
+                <div class="form-group full-width">
+                    <label for="token-calculator-server">Server Config</label>
+                    <select id="token-calculator-server">${options}</select>
+                </div>
+                <div class="form-group">
+                    <label for="token-input-price">Input Tokens Price</label>
+                    <input type="number" id="token-input-price" min="0" step="0.000001" placeholder="0.00" value="${escapeHtml(tokenCalculatorInputPrice)}">
+                </div>
+                <div class="form-group">
+                    <label for="token-output-price">Output Tokens Price</label>
+                    <input type="number" id="token-output-price" min="0" step="0.000001" placeholder="0.00" value="${escapeHtml(tokenCalculatorOutputPrice)}">
+                </div>
+                <div class="form-group">
+                    <label for="token-price-magnitude">Pricing Unit</label>
+                    <select id="token-price-magnitude">
+                        ${option('1', 'Per token', tokenCalculatorMagnitude)}
+                        ${option('1000', 'Per 1K tokens (/K)', tokenCalculatorMagnitude)}
+                        ${option('1000000', 'Per 1M tokens (/M)', tokenCalculatorMagnitude)}
+                        ${option('1000000000', 'Per 1B tokens (/B)', tokenCalculatorMagnitude)}
+                    </select>
+                </div>
+            </div>
+            <div class="calculator-summary" id="token-calculator-summary">
+                ${renderTokenCalculatorSummary(usage, costs)}
+            </div>
+        </section>`;
+}
+
+function bindTokenCalculatorEvents() {
+    document.getElementById('token-calculator-server')?.addEventListener('change', e => {
+        tokenCalculatorConfigId = e.target.value;
+        updateTokenCalculatorSummary();
+    });
+    document.getElementById('token-input-price')?.addEventListener('input', e => {
+        tokenCalculatorInputPrice = e.target.value;
+        updateTokenCalculatorSummary();
+    });
+    document.getElementById('token-output-price')?.addEventListener('input', e => {
+        tokenCalculatorOutputPrice = e.target.value;
+        updateTokenCalculatorSummary();
+    });
+    document.getElementById('token-price-magnitude')?.addEventListener('change', e => {
+        tokenCalculatorMagnitude = e.target.value;
+        updateTokenCalculatorSummary();
+    });
+}
+
+function updateTokenCalculatorSummary() {
+    const panel = document.getElementById('token-calculator-summary');
+    if (!panel) return;
+    panel.innerHTML = renderTokenCalculatorSummary(tokenUsage(tokenCalculatorServer()), tokenCalculatorCosts());
+}
+
+function renderTokenCalculatorSummary(usage, costs) {
+    return `
+        <div class="calculator-total">
+            <span class="calculator-total-label">Estimated Spend</span>
+            <strong>${formatCurrency(costs.totalCost)}</strong>
+        </div>
+        <div class="calculator-breakdown">
+            <div>
+                <span class="label">Input Tokens</span>
+                <span class="value">${formatTokens(usage.prompt_tokens)}</span>
+                <span class="cost">${formatCurrency(costs.inputCost)}</span>
+            </div>
+            <div>
+                <span class="label">Output Tokens</span>
+                <span class="value">${formatTokens(usage.completion_tokens)}</span>
+                <span class="cost">${formatCurrency(costs.outputCost)}</span>
+            </div>
+            <div>
+                <span class="label">Total Tokens</span>
+                <span class="value">${formatTokens(usage.total_tokens)}</span>
+                <span class="cost">${usage.request_count.toLocaleString()} requests</span>
+            </div>
+        </div>`;
 }
 
 function renderSettingsPage() {
@@ -1355,6 +1839,49 @@ function formatPower(draw, limit) {
     return `${limit.toFixed(0)} W max`;
 }
 
+function tokenUsage(server) {
+    return server?.token_usage || {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        request_count: 0,
+        last_used_at: null,
+    };
+}
+
+function formatTokens(value) {
+    const tokens = numberOrNull(value) || 0;
+    return tokens.toLocaleString();
+}
+
+function tokenCalculatorServer() {
+    return servers.find(s => s.config.id === tokenCalculatorConfigId) || servers[0] || null;
+}
+
+function tokenCalculatorCosts() {
+    const usage = tokenUsage(tokenCalculatorServer());
+    const magnitude = Math.max(1, numberOrNull(tokenCalculatorMagnitude) || 1000000);
+    const inputPrice = numberOrNull(tokenCalculatorInputPrice) || 0;
+    const outputPrice = numberOrNull(tokenCalculatorOutputPrice) || 0;
+    const inputCost = (usage.prompt_tokens / magnitude) * inputPrice;
+    const outputCost = (usage.completion_tokens / magnitude) * outputPrice;
+    return {
+        inputCost,
+        outputCost,
+        totalCost: inputCost + outputCost,
+    };
+}
+
+function formatCurrency(value) {
+    const amount = numberOrNull(value) || 0;
+    return amount.toLocaleString(undefined, {
+        style: 'currency',
+        currency: 'USD',
+        minimumFractionDigits: amount > 0 && amount < 0.01 ? 6 : 2,
+        maximumFractionDigits: amount > 0 && amount < 0.01 ? 6 : 2,
+    });
+}
+
 function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str ?? '';
@@ -1368,6 +1895,10 @@ function shellQuote(value) {
 
 function serverUrl(config) {
     return `http://${config.host}:${config.port}`;
+}
+
+function trackedChatUrl(config) {
+    return `${window.location.origin}${API_BASE}/configs/${config.id}/v1/chat/completions`;
 }
 
 function relativeTime(iso) {
@@ -1406,6 +1937,14 @@ function gearIcon(size) {
 
 function terminalIcon(size) {
     return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
+}
+
+function chatIcon(size) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><line x1="8" y1="9" x2="16" y2="9"/><line x1="8" y1="13" x2="13" y2="13"/></svg>`;
+}
+
+function calculatorIcon(size) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="10" y2="16"/><line x1="14" y1="16" x2="16" y2="16"/></svg>`;
 }
 
 function plusIcon(size) {

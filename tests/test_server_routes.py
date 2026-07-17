@@ -8,12 +8,14 @@ from fastapi.testclient import TestClient
 from llmhub.server import app
 import llmhub.config_manager as cm
 import llmhub.settings_manager as sm
+import llmhub.token_tracker as tt
 
 
 @pytest.fixture(autouse=True)
 def isolated_config_file(tmp_path, monkeypatch):
     monkeypatch.setattr(cm, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(sm, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(tt, "TOKEN_USAGE_FILE", tmp_path / "token_usage.json")
 
 
 @pytest.fixture
@@ -320,3 +322,330 @@ def test_benchmark_endpoint(client, monkeypatch):
     assert res.json()["ok"] is True
     assert res.json()["latency_ms"] is not None
     assert res.json()["completion_tokens"] == 4
+
+    listed = client.get("/api/configs")
+    assert listed.json()[0]["token_usage"]["prompt_tokens"] == 6
+    assert listed.json()[0]["token_usage"]["completion_tokens"] == 4
+    assert listed.json()[0]["token_usage"]["total_tokens"] == 10
+    assert listed.json()[0]["token_usage"]["request_count"] == 1
+
+
+def test_completion_proxy_tracks_token_usage(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Proxy", "model_path": "/tmp/model.gguf", "port": 8096},
+    ).json()
+    config_id = created["config"]["id"]
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        content = b'{"id":"cmpl","usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}'
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"usage": {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["data"] = kwargs["data"]
+        return FakeResponse()
+
+    monkeypatch.setattr("llmhub.server._requests.request", fake_request)
+
+    res = client.post(
+        f"/api/configs/{config_id}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert res.status_code == 200
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:8096/v1/chat/completions"
+    assert b"messages" in captured["data"]
+
+    usage = client.get(f"/api/configs/{config_id}/tokens")
+    assert usage.status_code == 200
+    assert usage.json()["prompt_tokens"] == 7
+    assert usage.json()["completion_tokens"] == 5
+    assert usage.json()["total_tokens"] == 12
+    assert usage.json()["request_count"] == 1
+
+
+def test_proxy_forwards_get_v1_models(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Models Proxy", "model_path": "/tmp/model.gguf", "port": 8097},
+    ).json()
+    config_id = created["config"]["id"]
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        content = b'{"data":[{"id":"local-model"}]}'
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": "local-model"}]}
+
+    def fake_request(method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr("llmhub.server._requests.request", fake_request)
+
+    res = client.get(f"/api/configs/{config_id}/v1/models")
+
+    assert res.status_code == 200
+    assert res.json()["data"][0]["id"] == "local-model"
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://127.0.0.1:8097/v1/models"
+
+
+def test_proxy_streaming_records_usage(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Stream Proxy", "model_path": "/tmp/model.gguf", "port": 8098},
+    ).json()
+    config_id = created["config"]["id"]
+
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    class FakeStreamResponse:
+        ok = True
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        @staticmethod
+        def iter_content(chunk_size=None):
+            yield from chunks
+
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr("llmhub.server._requests.request", lambda *args, **kwargs: FakeStreamResponse())
+
+    res = client.post(
+        f"/api/configs/{config_id}/v1/chat/completions",
+        json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert res.status_code == 200
+    assert b"[DONE]" in res.content
+
+    usage = client.get(f"/api/configs/{config_id}/tokens").json()
+    assert usage["prompt_tokens"] == 9
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 12
+    assert usage["request_count"] == 1
+
+
+def test_proxy_accepts_non_utf8_body(monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(sm, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(tt, "TOKEN_USAGE_FILE", tmp_path / "token_usage.json")
+    tolerant_client = TestClient(app, raise_server_exceptions=False)
+
+    created = tolerant_client.post(
+        "/api/configs",
+        json={"name": "Raw Proxy", "model_path": "/tmp/model.gguf", "port": 8099},
+    ).json()
+    config_id = created["config"]["id"]
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        content = b'{"ok":true}'
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    monkeypatch.setattr("llmhub.server._requests.request", lambda *args, **kwargs: FakeResponse())
+
+    res = tolerant_client.post(
+        f"/api/configs/{config_id}/v1/completions",
+        content=b"\xff\xfe not utf-8",
+        headers={"content-type": "application/json"},
+    )
+
+    assert res.status_code == 200
+
+
+def test_proxy_does_not_block_other_requests(monkeypatch):
+    import threading
+    import time as _time
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        content = b'{"ok":true}'
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    def slow_upstream(*args, **kwargs):
+        _time.sleep(1.5)
+        return FakeResponse()
+
+    monkeypatch.setattr("llmhub.server._requests.post", slow_upstream)
+    monkeypatch.setattr("llmhub.server._requests.request", slow_upstream)
+
+    # A context-managed TestClient shares one event loop across requests,
+    # so a handler that blocks the loop stalls the concurrent request below.
+    with TestClient(app) as shared:
+        created = shared.post(
+            "/api/configs",
+            json={"name": "Slow Proxy", "model_path": "/tmp/model.gguf", "port": 8100},
+        ).json()
+        config_id = created["config"]["id"]
+
+        proxy_result = {}
+
+        def call_proxy():
+            proxy_result["response"] = shared.post(
+                f"/api/configs/{config_id}/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        thread = threading.Thread(target=call_proxy)
+        thread.start()
+        _time.sleep(0.3)
+
+        started = _time.perf_counter()
+        res = shared.get("/api/presets")
+        elapsed = _time.perf_counter() - started
+        thread.join()
+
+    assert res.status_code == 200
+    assert proxy_result["response"].status_code == 200
+    assert elapsed < 1.0, f"event loop blocked for {elapsed:.2f}s while proxying"
+
+
+def test_configs_list_survives_corrupt_token_usage_file(client, tmp_path):
+    client.post(
+        "/api/configs",
+        json={"name": "Corrupt Usage", "model_path": "/tmp/model.gguf"},
+    )
+    (tmp_path / "token_usage.json").write_text("{broken json")
+
+    res = client.get("/api/configs")
+
+    assert res.status_code == 200
+    assert res.json()[0]["token_usage"]["total_tokens"] == 0
+
+
+def test_delete_config_survives_corrupt_token_usage_file(client, tmp_path):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Corrupt Delete", "model_path": "/tmp/model.gguf"},
+    ).json()
+    config_id = created["config"]["id"]
+    (tmp_path / "token_usage.json").write_text("{broken json")
+
+    assert client.delete(f"/api/configs/{config_id}").status_code == 204
+    assert client.get(f"/api/configs/{config_id}").status_code == 404
+
+
+def test_benchmark_survives_tracker_failure(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Bench Guard", "model_path": "/tmp/model.gguf", "port": 8101},
+    ).json()
+    config_id = created["config"]["id"]
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json():
+            return {"usage": {"prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10}}
+
+    monkeypatch.setattr("llmhub.server._requests.post", lambda *args, **kwargs: FakeResponse())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("tracker down")
+
+    monkeypatch.setattr(tt, "record_response_usage", boom)
+
+    res = client.post(f"/api/configs/{config_id}/benchmark")
+
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert res.json()["completion_tokens"] == 4
+
+
+def test_replace_import_resets_token_usage(client):
+    first = client.post(
+        "/api/configs",
+        json={"name": "Keep Import", "model_path": "/tmp/model.gguf", "port": 8102},
+    ).json()
+    second = client.post(
+        "/api/configs",
+        json={"name": "Drop Import", "model_path": "/tmp/model.gguf", "port": 8103},
+    ).json()
+    first_id = first["config"]["id"]
+    second_id = second["config"]["id"]
+    tt.record_usage(first_id, prompt_tokens=5, completion_tokens=5)
+    tt.record_usage(second_id, prompt_tokens=7, completion_tokens=7)
+
+    exported = client.get(f"/api/configs/{first_id}/export").json()
+    res = client.post("/api/configs/import", json={"configs": [exported], "replace": True})
+
+    assert res.status_code == 200
+    assert res.json()[0]["config"]["id"] == first_id
+    assert tt.get_usage(first_id).request_count == 0
+    assert tt.get_usage(second_id).request_count == 0
+
+
+def test_list_configs_reads_usage_file_once(client, monkeypatch):
+    for index in range(3):
+        client.post(
+            "/api/configs",
+            json={"name": f"Poll {index}", "model_path": "/tmp/model.gguf", "port": 8110 + index},
+        )
+
+    calls = {"count": 0}
+    original = tt._read_all
+
+    def counting_read_all():
+        calls["count"] += 1
+        return original()
+
+    monkeypatch.setattr(tt, "_read_all", counting_read_all)
+
+    res = client.get("/api/configs")
+
+    assert res.status_code == 200
+    assert len(res.json()) == 3
+    assert calls["count"] == 1
+
+
+def test_reset_token_usage(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Reset Usage", "model_path": "/tmp/model.gguf"},
+    ).json()
+    config_id = created["config"]["id"]
+    tt.record_usage(config_id, prompt_tokens=3, completion_tokens=2)
+
+    reset = client.post(f"/api/configs/{config_id}/tokens/reset")
+    assert reset.status_code == 200
+    assert reset.json()["prompt_tokens"] == 0
+    assert client.get(f"/api/configs/{config_id}/tokens").json()["total_tokens"] == 0

@@ -1,38 +1,25 @@
 """CRUD operations for server configurations, persisted to config.json."""
 
-import json
-import os
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
+from . import storage
 from .models import CURRENT_SCHEMA_VERSION, ServerConfig, ServerConfigCreate, ServerConfigUpdate
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return storage.now_iso()
 
 
 def _config_file() -> Path:
-    data_dir = os.environ.get("LLMHUB_DATA_DIR")
-    if data_dir:
-        path = Path(data_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path / "config.json"
-    return CONFIG_FILE
+    return storage.data_file(CONFIG_FILE)
 
 
 def _read_all() -> dict[str, dict]:
     """Read raw config dict from disk."""
-    config_file = _config_file()
-    if not config_file.exists():
-        return {}
-    text = config_file.read_text()
-    if not text.strip():
-        return {}
-    raw = json.loads(text)
+    raw = storage.read_json_dict(_config_file())
     changed = False
     for key, value in list(raw.items()):
         migrated, did_change = _migrate_config(value)
@@ -71,7 +58,7 @@ def _migrate_config(data: dict) -> tuple[dict, bool]:
 
 def _write_all(data: dict[str, dict]) -> None:
     """Write config dict to disk."""
-    _config_file().write_text(json.dumps(data, indent=2))
+    storage.write_json_atomic(_config_file(), data)
 
 
 def list_configs() -> list[ServerConfig]:
