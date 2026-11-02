@@ -8,6 +8,7 @@ LLM Hub is a local web interface for configuring and managing `llama.cpp` model 
 
 - Saves reusable `llama-server` configurations for GGUF models.
 - Validates model paths, ports, numeric settings, `.mmproj` paths, and extra argument syntax.
+- Sets a per-config output token limit for server generation and requests through the Hub proxy.
 - Starts, stops, and restarts local `llama-server` processes from the browser.
 - Detects already-running configured servers on startup when possible.
 - Shows health states: healthy, loading, unreachable, and stopped.
@@ -24,21 +25,27 @@ LLM Hub is a local web interface for configuring and managing `llama.cpp` model 
 - Exports individual configs and imports either one config, an array, or a wrapped `{configs: [...]}` export.
 - Tests the OpenAI-compatible `/v1/models` endpoint for a running config.
 - Runs a quick `/v1/chat/completions` benchmark for configured endpoints.
+- Runs configurable local performance matrices with `llama-bench`, including prompt processing, generation, thread, GPU-layer, batch, micro-batch, and flash-attention sweeps.
 - Tracks input and output token totals per config for benchmarks and requests sent through LLM Hub's OpenAI-compatible proxy routes.
 - Estimates per-config token spend from tracked usage and user-supplied input/output prices.
-- Provides a lightweight chat page for sending test messages to a selected config.
+- Provides a chat page for testing a selected config: replies stream in live and can be stopped, answers render as Markdown (code blocks with copy buttons, lists, tables), and reasoning models' chain of thought is shown in a collapsible "Thought process" section separate from the answer.
 - Shows best-effort system RAM telemetry and GPU telemetry from `nvidia-smi` or `rocm-smi` when available.
 - Streams, filters, annotates, copies, downloads, and clears retained stdout/stderr from managed server processes.
+- Retains recent structured `llama-bench` results with live progress, cancellation, comparison tables, and JSON export.
+- Offers searchable card and table layouts, grouped by running and stopped servers, with direct Chat and Logs actions.
+- Keeps filters, form drafts, focus, and scroll position during live refreshes and shares model selection between pages.
+- Preserves the last known data during connection failures and retries automatically.
+- Provides responsive layouts, keyboard navigation, accessible dialogs, and inline configuration validation.
 
 ## Screens
 
-The hub is the control room. Each configured model appears as a card with its current status, address, model name, GPU layer setting, context size, and start/stop actions.
+The Overview page groups running and stopped models beneath a compact resource summary. Switch between searchable cards and a table, start or stop a server, or open its Chat and Logs directly. Each model shows its context window and output limit separately from tracked token usage.
 
 ![Server cards in the hub](assets/screenshots/hub.png)
 
-When telemetry is available, the Hub page also shows system memory and GPU cards so you can see VRAM, utilization, temperature, and power data before starting or tuning a server.
+When telemetry is available, the resource summary shows system memory, VRAM, GPU utilization, and temperature before you start or tune a server.
 
-Server definitions live in the Configs page. A config maps a model path to a host, port, GPU layer count, context window, thread count, parallel slots, optional multimodal projector, and any extra `llama-server` flags you need.
+Server definitions live in the Configs page. The editor groups Model, Generation, and Hardware settings, with network, vision, and runtime options under Advanced. Output tokens can use a finite limit or the Unlimited toggle. Validation errors appear beside the affected fields.
 
 ![Server configuration form](assets/screenshots/config.png)
 
@@ -92,6 +99,14 @@ http://localhost:8005
 
 The included `run.sh` does the same thing for this local checkout after activating `.venv`.
 
+Set `LLMHUB_RELOAD=1` to enable auto-reload while developing. It is off by default because each reload restarts the app, which stops every managed `llama-server`.
+
+Requests are only accepted for the hostnames `localhost`, `127.0.0.1`, and `[::1]`, which blocks DNS-rebinding attacks from web pages. To reach the Hub under another name, list it in `LLMHUB_ALLOWED_HOSTS` (comma-separated, replacing the defaults):
+
+```bash
+LLMHUB_ALLOWED_HOSTS=localhost,127.0.0.1,myhost.lan python main.py
+```
+
 To install a shell alias so you can start the app with `hub`:
 
 ```bash
@@ -137,6 +152,12 @@ Token usage counters are stored in:
 llmhub/token_usage.json
 ```
 
+Recent `llama-bench` results are stored in:
+
+```text
+llmhub/benchmark_history.json
+```
+
 Set `LLMHUB_DATA_DIR` to store runtime config outside the package directory:
 
 ```bash
@@ -145,6 +166,21 @@ LLMHUB_DATA_DIR=/path/to/llmhub-data python main.py
 
 When `LLMHUB_DATA_DIR` is set, both `config.json` and `settings.json` are written in that directory instead of under `llmhub/`.
 Token usage is also written there as `token_usage.json`.
+Benchmark history is written there as `benchmark_history.json`.
+
+## Benchmarking
+
+The **Benchmark** tab runs the standalone `llama-bench` tool included with llama.cpp. It is separate from the quick HTTP endpoint benchmark available on server cards: the tab loads the GGUF directly and measures inference throughput across a configurable matrix.
+
+LLM Hub discovers `llama-bench` on `PATH`. You can also set a default executable explicitly:
+
+```bash
+LLMHUB_LLAMA_BENCH=/path/to/llama.cpp/build/bin/llama-bench python main.py
+```
+
+An executable path can also be entered for an individual run. The built-in Quick, Standard, and Comprehensive profiles seed useful matrices; every field remains editable. A matrix is limited to 256 distinct tests to prevent accidental combinatorial runs, and each completed or failed run is retained in the recent-history panel. Stop the selected config's `llama-server` before benchmarking it. Other active workloads are allowed but can make performance comparisons less reliable.
+
+`llama-bench` measures prompt processing and token generation without tokenization or sampling time. LLM Hub requests JSON output and preserves the full result objects so fields added by newer llama.cpp versions remain available in exported run data.
 
 Each config includes:
 
@@ -153,6 +189,7 @@ Each config includes:
 - `host` and `port`: address passed to `llama-server`.
 - `n_gpu_layers`: GPU offload count, with `-1` meaning all layers.
 - `ctx_size`: context window size.
+- `n_predict`: maximum output tokens per response; `-1` (default) means unlimited, and `0` evaluates the prompt without generating output.
 - `threads`: CPU thread count.
 - `parallel`: concurrent request slots.
 - `cont_batching`: whether to pass `--cont-batching`.
@@ -163,6 +200,8 @@ Each config includes:
 - `preset`: optional preset identifier used to seed common settings.
 - `created_at`, `updated_at`, `last_started_at`, `last_used_at`: local metadata for sorting and display.
 - `schema_version`: config schema marker used for local migrations.
+
+The **Output Tokens** field is available when creating or editing a config. Existing configs default to unlimited output. A finite value is passed to `llama-server` as `--n-predict` and caps chat/completion requests through LLM Hub, including streamed requests and the quick endpoint benchmark. Smaller per-request limits, such as the Chat page's maximum output tokens, still apply. Direct requests to the raw llama-server URL can override its CLI default; use the Hub proxy to enforce the configured cap. Standalone `llama-bench` matrices use their own generation-token settings.
 
 App settings include default host, base port, GPU layers, context size, threads, parallel slots, preset, model scan directory, refresh interval, and retained terminal log lines. These defaults seed newly-created configs and scanner-generated configs; existing configs are not modified.
 
@@ -177,6 +216,10 @@ LLM Hub exposes a small JSON API under `/api`:
 - `GET /api/ram`
 - `GET /api/settings`
 - `PUT /api/settings`
+- `GET /api/benchmarks`
+- `POST /api/benchmarks`
+- `POST /api/benchmarks/{run_id}/stop`
+- `DELETE /api/benchmarks`
 - `GET /api/ports/free`
 - `GET /api/models/scan`
 - `GET /api/configs/export`
@@ -201,6 +244,8 @@ LLM Hub exposes a small JSON API under `/api`:
 
 Token tracking is exact when the proxied llama.cpp response includes the standard OpenAI-compatible `usage` object. Streamed responses are counted when the final stream chunk carries a `usage` object (llama.cpp includes it when clients request `stream_options: {"include_usage": true}`). Direct calls to the raw llama-server URL bypass LLM Hub and are not counted.
 
+Terminal output retains the configured number of recent lines. The output API's `total` is the next absolute line offset since process start, including lines already evicted or cleared; incremental clients should use it as their next `offset`. The Terminal page refreshes the retained snapshot so partial lines, clears, and restarts are reflected as well.
+
 ## Development
 
 Run the test suite with:
@@ -215,6 +260,12 @@ or, inside an activated environment:
 pytest
 ```
 
+Frontend behavior tests use Node's built-in test runner:
+
+```bash
+node --test tests/test_ui.js
+```
+
 Project layout:
 
 ```text
@@ -225,11 +276,13 @@ llmhub/
   settings_manager.py  app defaults and UI settings persistence
   gpu_monitor.py       best-effort NVIDIA/AMD GPU telemetry
   ram_monitor.py       best-effort system memory telemetry
+  benchmark_manager.py llama-bench subprocesses and result history
   models.py            Pydantic request/response models
 ui/
   index.html           SPA shell
   app.js               client-side routing and API calls
   styles.css           UI styles
+  workspace.css        workspace theme and responsive interaction styles
 assets/screenshots/    README screenshots
 tests/                 route and manager tests
 ```

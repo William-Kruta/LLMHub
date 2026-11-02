@@ -3,11 +3,12 @@
 import uuid
 import shlex
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _validate_common(values: dict) -> dict:
@@ -44,6 +45,7 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8080, ge=1, le=65535, description="Listen port")
     n_gpu_layers: int = Field(default=-1, ge=-1, description="GPU layers to offload (-1 = all)")
     ctx_size: int = Field(default=4096, ge=128, description="Context window size")
+    n_predict: int = Field(default=-1, ge=-1, description="Maximum output tokens (-1 = unlimited)")
     threads: int = Field(default=4, ge=1, description="CPU threads for generation")
     parallel: int = Field(default=1, ge=1, description="Concurrent request slots")
     cont_batching: bool = Field(default=True, description="Enable continuous batching")
@@ -67,6 +69,7 @@ class ServerConfigCreate(BaseModel):
     port: int = Field(default=8080, ge=1, le=65535)
     n_gpu_layers: int = Field(default=-1, ge=-1)
     ctx_size: int = Field(default=4096, ge=128)
+    n_predict: int = Field(default=-1, ge=-1)
     threads: int = Field(default=4, ge=1)
     parallel: int = Field(default=1, ge=1)
     cont_batching: bool = True
@@ -119,6 +122,7 @@ class ServerConfigUpdate(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     n_gpu_layers: int | None = Field(default=None, ge=-1)
     ctx_size: int | None = Field(default=None, ge=128)
+    n_predict: int | None = Field(default=None, ge=-1)
     threads: int | None = Field(default=None, ge=1)
     parallel: int | None = Field(default=None, ge=1)
     cont_batching: bool | None = None
@@ -127,6 +131,13 @@ class ServerConfigUpdate(BaseModel):
     env_vars: dict[str, str] | None = None
     preset: str | None = None
     mmproj_path: str | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("Config fields cannot be null; omit fields to leave them unchanged")
+        return value
 
     @field_validator("model_path")
     @classmethod
@@ -292,6 +303,109 @@ class BenchmarkResult(BaseModel):
     completion_tokens: int | None = None
     total_tokens: int | None = None
     tokens_per_second: float | None = None
+
+
+class LlamaBenchRequest(BaseModel):
+    """A matrix of local llama-bench performance tests."""
+
+    config_id: str = Field(..., min_length=1)
+    binary_path: str = ""
+    prompt_tokens: list[int] = Field(default_factory=lambda: [128, 512, 2048])
+    generation_tokens: list[int] = Field(default_factory=lambda: [64, 128, 256])
+    threads: list[int] = Field(default_factory=lambda: [4])
+    gpu_layers: list[int] = Field(default_factory=lambda: [-1])
+    batch_sizes: list[int] = Field(default_factory=lambda: [2048])
+    ubatch_sizes: list[int] = Field(default_factory=lambda: [512])
+    flash_attention: list[Literal["auto", "on", "off"]] = Field(default_factory=lambda: ["auto"])
+    repetitions: int = Field(default=5, ge=1, le=20)
+    no_warmup: bool = False
+    extra_args: str = ""
+
+    @field_validator("prompt_tokens", "generation_tokens")
+    @classmethod
+    def validate_token_counts(cls, value: list[int]) -> list[int]:
+        if any(item <= 0 for item in value):
+            raise ValueError("Token counts must be positive integers")
+        return list(dict.fromkeys(value))
+
+    @field_validator("threads", "batch_sizes", "ubatch_sizes")
+    @classmethod
+    def validate_positive_matrix(cls, value: list[int]) -> list[int]:
+        if not value or any(item <= 0 for item in value):
+            raise ValueError("Benchmark matrix values must be positive integers")
+        return list(dict.fromkeys(value))
+
+    @field_validator("gpu_layers")
+    @classmethod
+    def validate_gpu_layers(cls, value: list[int]) -> list[int]:
+        if not value or any(item < -1 for item in value):
+            raise ValueError("GPU layer values must be -1 or greater")
+        return list(dict.fromkeys(value))
+
+    @field_validator("flash_attention")
+    @classmethod
+    def validate_flash_attention(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("At least one flash attention mode is required")
+        return list(dict.fromkeys(value))
+
+    @field_validator("extra_args")
+    @classmethod
+    def validate_benchmark_extra_args(cls, value: str) -> str:
+        try:
+            args = shlex.split(value) if value.strip() else []
+        except ValueError as exc:
+            raise ValueError(f"Extra arguments are not valid shell-style syntax: {exc}") from exc
+        controlled = {"-m", "--model", "-o", "--output", "-oe", "--output-err"}
+        if any(arg in controlled for arg in args):
+            raise ValueError("Model and output flags are managed by LLM Hub")
+        return value
+
+    @model_validator(mode="after")
+    def validate_matrix_size(self):
+        if not self.prompt_tokens and not self.generation_tokens:
+            raise ValueError("Select at least one prompt or generation token count")
+        base_tests = len(self.prompt_tokens) + len(self.generation_tokens)
+        combinations = (
+            base_tests
+            * len(self.threads)
+            * len(self.gpu_layers)
+            * len(self.batch_sizes)
+            * len(self.ubatch_sizes)
+            * len(self.flash_attention)
+        )
+        if combinations > 256:
+            raise ValueError(f"Benchmark matrix has {combinations} tests; the maximum is 256")
+        return self
+
+
+class LlamaBenchRun(BaseModel):
+    """Runtime and persisted result data for one llama-bench invocation."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    status: Literal["running", "stopping", "completed", "failed", "cancelled"] = "running"
+    config_id: str
+    config_name: str
+    model_path: str
+    params: LlamaBenchRequest
+    command: list[str] = Field(default_factory=list)
+    command_text: str = ""
+    started_at: str
+    finished_at: str | None = None
+    duration_seconds: float | None = None
+    exit_code: int | None = None
+    error: str | None = None
+    log_lines: list[str] = Field(default_factory=list)
+    results: list[dict] = Field(default_factory=list)
+
+
+class LlamaBenchOverview(BaseModel):
+    """Availability, active work, and recent llama-bench history."""
+
+    available: bool
+    binary_path: str | None = None
+    active: LlamaBenchRun | None = None
+    history: list[LlamaBenchRun] = Field(default_factory=list)
 
 
 class LogAnnotation(BaseModel):

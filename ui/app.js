@@ -9,12 +9,28 @@ let settings = null;
 let serverPoller = null;
 let terminalPoller = null;
 let currentTerminalServerId = null;
-let currentTerminalOffset = 0;
+let terminalRequestId = 0;
 let terminalPaused = false;
 let terminalAutoScroll = true;
 let terminalLines = [];
 let hubFilter = '';
 let hubStateFilter = 'all';
+let hubVisionOnly = false;
+let hubView = readPreference('hub-view', 'cards');
+let selectedConfigId = readPreference('selected-config', '');
+let renderVersion = 0;
+let renderedPage = '';
+let hubPollVersion = 0;
+let benchmarkPollVersion = 0;
+let serverDataLoaded = false;
+let connectionRetryTimer = null;
+const connectionErrors = new Map();
+const requestVersions = new Map();
+const pageStates = new Map();
+const chatDrafts = new Map();
+const pendingServerActions = new Map();
+const dialogStack = [];
+const pageLabels = {hub: 'Overview', configs: 'Configurations', terminal: 'Terminal', chat: 'Chat', benchmark: 'Benchmark', 'token-calculator': 'Token usage', settings: 'Settings'};
 let modelPathOptions = [];
 let modelPathOptionsDirectory = '';
 let modelPathActiveIndex = -1;
@@ -25,8 +41,16 @@ let tokenCalculatorMagnitude = '1000000';
 let chatConfigId = '';
 let chatMessagesByConfig = {};
 let chatSending = false;
+// The in-flight streamed reply: { configId, message, controller, frame }.
+let chatStream = null;
+let benchmarkOverview = { available: false, binary_path: null, active: null, history: [] };
+let benchmarkPoller = null;
+let benchmarkConfigId = '';
+let benchmarkDraft = null;
+let benchmarkSelectedRunId = '';
 let chatRequestSettings = {
-    maxTokens: '512',
+    // Reasoning models often spend 1-3k tokens thinking before they answer.
+    maxTokens: '4096',
     temperature: '0.7',
     topP: '0.95',
     presencePenalty: '0',
@@ -38,14 +62,27 @@ let chatRequestSettings = {
 };
 
 function navigate(page) {
-    currentPage = ['hub', 'configs', 'terminal', 'chat', 'token-calculator', 'settings'].includes(page) ? page : 'hub';
+    capturePageState();
+    stopHubPoller();
+    stopBenchmarkPoller();
+    stopTerminalPoller();
+    currentPage = Object.hasOwn(pageLabels, page) ? page : 'hub';
     document.querySelectorAll('.nav-item').forEach(el => {
-        el.classList.toggle('active', el.dataset.page === currentPage);
+        const active = el.dataset.page === currentPage;
+        el.classList.toggle('active', active);
+        if (active) el.setAttribute('aria-current', 'page');
+        else el.removeAttribute('aria-current');
     });
+    document.getElementById('page-label').textContent = pageLabels[currentPage];
     render();
 }
 
 function initRouter() {
+    if (selectedConfigId) rememberConfig(selectedConfigId);
+    document.querySelector('.skip-link')?.addEventListener('click', event => {
+        event.preventDefault();
+        document.getElementById('main-content').focus();
+    });
     window.addEventListener('hashchange', () => navigate(location.hash.replace('#', '') || 'hub'));
     navigate(location.hash.replace('#', '') || 'hub');
 }
@@ -80,117 +117,230 @@ async function apiDelete(path) {
 }
 
 async function apiError(res) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    return new Error(err.detail || 'Request failed');
+    const response = await res.json().catch(() => ({detail: res.statusText}));
+    const detail = response.detail;
+    const error = new Error(Array.isArray(detail) ? detail.map(item => item.msg).join('; ') : detail || 'Request failed');
+    error.fields = Array.isArray(detail) ? detail : [];
+    return error;
 }
 
-async function fetchServers({ quiet = false } = {}) {
+async function fetchResource(name, path, apply) {
+    const version = (requestVersions.get(name) || 0) + 1;
+    requestVersions.set(name, version);
     try {
-        servers = await apiGet('/configs');
-    } catch (e) {
-        servers = [];
-        if (!quiet) showToast('Failed to fetch servers: ' + e.message, 'error');
+        const data = await apiGet(path);
+        if (requestVersions.get(name) !== version) return;
+        apply(data);
+        connectionErrors.delete(name);
+    } catch (error) {
+        if (requestVersions.get(name) !== version) return;
+        connectionErrors.set(name, error.message);
     }
+    updateConnectionNotice();
 }
 
-async function fetchGpus({ quiet = false } = {}) {
-    try {
-        gpus = await apiGet('/gpus');
-    } catch (e) {
-        gpus = [];
-        if (!quiet) showToast('Failed to fetch GPU status: ' + e.message, 'error');
-    }
+async function fetchServers() {
+    await fetchResource('servers', '/configs', data => {
+        servers = data;
+        serverDataLoaded = true;
+        if (!servers.some(server => server.config.id === selectedConfigId)) {
+            rememberConfig((servers.find(server => server.running) || servers[0])?.config.id || '');
+        }
+    });
 }
 
-async function fetchRam({ quiet = false } = {}) {
-    try {
-        ram = await apiGet('/ram');
-    } catch (e) {
-        ram = null;
-        if (!quiet) showToast('Failed to fetch RAM status: ' + e.message, 'error');
-    }
+async function fetchGpus() {
+    await fetchResource('GPU telemetry', '/gpus', data => { gpus = data; });
+}
+
+async function fetchRam() {
+    await fetchResource('RAM telemetry', '/ram', data => { ram = data; });
 }
 
 async function fetchPresets() {
     if (presets.length) return;
-    try {
-        presets = await apiGet('/presets');
-    } catch {
-        presets = [];
-    }
+    await fetchResource('presets', '/presets', data => { presets = data; });
 }
 
 async function fetchSettings() {
-    try {
-        settings = await apiGet('/settings');
-    } catch {
-        settings = {
-            default_host: '127.0.0.1',
-            default_base_port: 8080,
-            default_threads: 4,
-            default_ctx_size: 4096,
-            default_n_gpu_layers: -1,
-            default_parallel: 1,
-            default_preset: 'custom',
-            model_scan_directory: '',
-            refresh_interval_ms: 3000,
-            terminal_retention_lines: 2000,
-        };
+    if (settings && !connectionErrors.has('settings')) return;
+    await fetchResource('settings', '/settings', data => { settings = data; });
+}
+
+async function fetchBenchmarks() {
+    await fetchResource('benchmarks', '/benchmarks', data => { benchmarkOverview = data; });
+}
+
+function updateConnectionNotice() {
+    const notice = document.getElementById('connection-notice');
+    const indicator = document.getElementById('connection-indicator');
+    if (!notice || !indicator) return;
+    const offline = connectionErrors.has('servers');
+    indicator.classList.toggle('offline', offline);
+    indicator.innerHTML = `<span class="status-dot"></span>${offline ? 'Reconnecting' : serverDataLoaded ? 'Connected locally' : 'Connecting'}`;
+    const message = offline
+        ? `Connection lost — retrying. ${serverDataLoaded ? 'Showing the last known server status.' : 'Your saved configurations will appear when the connection returns.'}`
+        : connectionErrors.size ? `${[...connectionErrors.keys()].join(', ')} unavailable. Retrying…` : '';
+    notice.hidden = !message;
+    notice.innerHTML = message ? `<span>${escapeHtml(message)}</span><button class="btn btn-ghost btn-sm" id="retry-connection">Retry now</button>` : '';
+    notice.querySelector('#retry-connection')?.addEventListener('click', () => render());
+    if (connectionErrors.size && !connectionRetryTimer) {
+        connectionRetryTimer = setTimeout(() => {
+            connectionRetryTimer = null;
+            render();
+        }, 5000);
+    } else if (!connectionErrors.size && connectionRetryTimer) {
+        clearTimeout(connectionRetryTimer);
+        connectionRetryTimer = null;
     }
 }
 
 async function render() {
-    await Promise.all([fetchServers(), fetchGpus(), fetchRam(), fetchPresets(), fetchSettings()]);
+    if (renderedPage === currentPage) capturePageState();
+    const page = currentPage;
+    const version = ++renderVersion;
     const main = document.getElementById('main-content');
     stopHubPoller();
-
-    if (currentPage === 'configs') {
-        stopTerminalPoller();
-        main.innerHTML = renderConfigsPage();
-        bindConfigEvents();
-    } else if (currentPage === 'terminal') {
-        main.innerHTML = renderTerminalPage();
-        bindTerminalEvents();
-    } else if (currentPage === 'chat') {
-        stopTerminalPoller();
-        main.innerHTML = renderChatPage();
-        bindChatEvents();
-    } else if (currentPage === 'token-calculator') {
-        stopTerminalPoller();
-        main.innerHTML = renderTokenCalculatorPage();
-        bindTokenCalculatorEvents();
-    } else if (currentPage === 'settings') {
-        stopTerminalPoller();
-        main.innerHTML = renderSettingsPage();
-        bindSettingsEvents();
-    } else {
-        stopTerminalPoller();
-        main.innerHTML = renderHubPage();
-        bindHubEvents();
-        startHubPoller();
+    stopBenchmarkPoller();
+    if (page !== 'terminal') stopTerminalPoller();
+    main.setAttribute('aria-busy', 'true');
+    if (renderedPage !== page || !main.children.length) {
+        main.innerHTML = `<div class="page-loading" role="status"><div class="loading-mark"></div><p>Loading ${escapeHtml(pageLabels[page].toLowerCase())}…</p><div class="skeleton-grid"><div></div><div></div><div></div></div></div>`;
     }
+    const requests = [fetchServers(), fetchSettings(), fetchPresets()];
+    if (page === 'hub' || connectionErrors.has('GPU telemetry')) requests.push(fetchGpus());
+    if (page === 'hub' || connectionErrors.has('RAM telemetry')) requests.push(fetchRam());
+    if (page === 'benchmark' || connectionErrors.has('benchmarks')) requests.push(fetchBenchmarks());
+    await Promise.all(requests);
+    if (version !== renderVersion || page !== currentPage) return;
+    // Capture edits made while this refresh was in flight.
+    if (renderedPage === page && !main.querySelector('.page-loading')) capturePageState();
+    if (!serverDataLoaded) {
+        main.innerHTML = `<div class="empty-state connection-empty"><div class="empty-state-icon">${serverIcon(30)}</div><h1>Waiting for your workspace</h1><p>We’re reconnecting to LLM Hub. Your saved models haven’t been changed.</p><button class="btn btn-primary" id="retry-workspace">Try again</button></div>`;
+        document.getElementById('retry-workspace').onclick = () => render();
+    } else {
+        const views = {hub: [renderHubPage, bindHubEvents], configs: [renderConfigsPage, bindConfigEvents], terminal: [renderTerminalPage, bindTerminalEvents], chat: [renderChatPage, bindChatEvents], benchmark: [renderBenchmarkPage, bindBenchmarkEvents], 'token-calculator': [renderTokenCalculatorPage, bindTokenCalculatorEvents], settings: [renderSettingsPage, bindSettingsEvents]};
+        const [view, bind] = views[page];
+        main.innerHTML = view();
+        restorePageState(page);
+        bind();
+    }
+    renderedPage = page;
+    main.setAttribute('aria-busy', 'false');
+    if (page === 'hub') startHubPoller();
+    if (page === 'benchmark') startBenchmarkPoller();
 }
 
 function startHubPoller() {
-    serverPoller = setInterval(async () => {
-        if (currentPage !== 'hub') {
-            stopHubPoller();
-            return;
-        }
-        await Promise.all([fetchServers({ quiet: true }), fetchGpus({ quiet: true }), fetchRam({ quiet: true })]);
-        const main = document.getElementById('main-content');
-        if (main) {
-            main.innerHTML = renderHubPage();
-            bindHubEvents();
-        }
-    }, settings?.refresh_interval_ms || 3000);
+    const version = ++hubPollVersion;
+    const poll = async () => {
+        await Promise.all([fetchServers(), fetchGpus(), fetchRam()]);
+        if (version !== hubPollVersion || currentPage !== 'hub') return;
+        refreshHubSurface();
+        serverPoller = setTimeout(poll, settings?.refresh_interval_ms || 3000);
+    };
+    serverPoller = setTimeout(poll, settings?.refresh_interval_ms || 3000);
 }
 
 function stopHubPoller() {
-    if (serverPoller) {
-        clearInterval(serverPoller);
-        serverPoller = null;
+    hubPollVersion += 1;
+    clearTimeout(serverPoller);
+    serverPoller = null;
+}
+
+function startBenchmarkPoller() {
+    if (!benchmarkOverview.active || benchmarkPoller) return;
+    const version = ++benchmarkPollVersion;
+    const poll = async () => {
+        await fetchBenchmarks();
+        if (version !== benchmarkPollVersion || currentPage !== 'benchmark') return;
+        refreshBenchmarkSurface();
+        benchmarkPoller = benchmarkOverview.active ? setTimeout(poll, 1000) : null;
+    };
+    benchmarkPoller = setTimeout(poll, 1000);
+}
+
+function stopBenchmarkPoller() {
+    benchmarkPollVersion += 1;
+    clearTimeout(benchmarkPoller);
+    benchmarkPoller = null;
+}
+
+function readPreference(key, fallback) {
+    try { return localStorage.getItem(`llmhub-${key}`) || fallback; } catch { return fallback; }
+}
+
+function writePreference(key, value) {
+    try { localStorage.setItem(`llmhub-${key}`, value); } catch { /* Storage can be disabled. */ }
+}
+
+function rememberConfig(id) {
+    selectedConfigId = id;
+    chatConfigId = id;
+    currentTerminalServerId = id;
+    benchmarkConfigId = id;
+    tokenCalculatorConfigId = id;
+    writePreference('selected-config', id);
+}
+
+function openServerPage(id, page) {
+    capturePageState();
+    rememberConfig(id);
+    if (page === 'benchmark') benchmarkDraft = null;
+    location.hash = page;
+    if (currentPage === page) render();
+}
+
+function capturePageState() {
+    if (!renderedPage) return;
+    const main = document.getElementById('main-content');
+    if (!main || main.querySelector('.page-loading')) return;
+    const fields = {};
+    main.querySelectorAll('input[id], select[id], textarea[id]').forEach(input => {
+        if (['chat-server-select', 'terminal-server-select', 'benchmark-config', 'token-calculator-server', 'chat-input'].includes(input.id)) return;
+        fields[input.id] = {value: input.value, checked: input.checked};
+    });
+    const focus = main.contains(document.activeElement) ? document.activeElement : null;
+    const scroll = [...main.querySelectorAll('.chat-window, .terminal-window, .benchmark-log, .benchmark-history-list, .server-table-wrap')].map(el => ({className: el.className, top: el.scrollTop, left: el.scrollLeft}));
+    pageStates.set(renderedPage, {fields, scroll, y: window.scrollY, focus: focus?.id, start: focus?.selectionStart, end: focus?.selectionEnd});
+    if (renderedPage === 'chat') {
+        const input = document.getElementById('chat-input');
+        if (input) chatDrafts.set(document.querySelector('.chat-panel')?.dataset.configId || chatConfigId, input.value);
     }
+}
+
+function restorePageState(page) {
+    const state = pageStates.get(page);
+    if (!state) return;
+    Object.entries(state.fields).forEach(([id, field]) => {
+        const input = document.getElementById(id);
+        if (!input || input.disabled) return;
+        input.value = field.value;
+        if (input.type === 'checkbox') input.checked = field.checked;
+    });
+    state.scroll.forEach(saved => {
+        const el = document.getElementsByClassName(saved.className)[0];
+        if (el) { el.scrollTop = saved.top; el.scrollLeft = saved.left; }
+    });
+    const focus = !dialogStack.length && state.focus ? document.getElementById(state.focus) : null;
+    focus?.focus({preventScroll: true});
+    if (focus && state.start != null && ['text', 'search', 'textarea'].includes(focus.type)) focus.setSelectionRange(state.start, state.end);
+    window.scrollTo({top: state.y, behavior: 'instant'});
+}
+
+function replaceSurface(id, html) {
+    const surface = document.getElementById(id);
+    if (!surface || surface.innerHTML === html) return;
+    const active = surface.contains(document.activeElement) ? document.activeElement.dataset.focusKey : null;
+    const openMenus = [...surface.querySelectorAll('details[open][data-menu-id]')].map(el => el.dataset.menuId);
+    const scroll = [...surface.querySelectorAll('.server-table-wrap, .benchmark-log, .benchmark-history-list')].map(el => ({className: el.className, top: el.scrollTop, left: el.scrollLeft}));
+    surface.innerHTML = html;
+    surface.querySelectorAll('details[data-menu-id]').forEach(el => { el.open = openMenus.includes(el.dataset.menuId); });
+    if (active) [...surface.querySelectorAll('[data-focus-key]')].find(el => el.dataset.focusKey === active)?.focus({preventScroll: true});
+    scroll.forEach(saved => {
+        const el = surface.getElementsByClassName(saved.className)[0];
+        if (el) { el.scrollTop = saved.top; el.scrollLeft = saved.left; }
+    });
 }
 
 function filteredServers() {
@@ -203,258 +353,171 @@ function filteredServers() {
             || (hubStateFilter === 'running' && s.running)
             || (hubStateFilter === 'stopped' && !s.running)
             || s.health === hubStateFilter;
-        return matchesText && matchesState;
+        const matchesVision = !hubVisionOnly || isVisionConfig(c);
+        return matchesText && matchesState && matchesVision;
     });
 }
 
+function isVisionConfig(config) {
+    return Boolean(config.mmproj_path?.trim());
+}
+
 function renderToolbar() {
-    return `
-        <div class="toolbar">
-            <input class="toolbar-search" id="hub-filter" type="search" placeholder="Filter by name, model, host, or port" value="${escapeHtml(hubFilter)}">
-            <select class="toolbar-select" id="hub-state-filter">
-                ${option('all', 'All states', hubStateFilter)}
-                ${option('running', 'Running', hubStateFilter)}
-                ${option('stopped', 'Stopped', hubStateFilter)}
-                ${option('healthy', 'Healthy', hubStateFilter)}
-                ${option('loading', 'Loading', hubStateFilter)}
-                ${option('unreachable', 'Unreachable', hubStateFilter)}
-            </select>
-        </div>`;
+    return `<div class="toolbar hub-toolbar">
+        <div class="search-field">${searchIcon(18)}<input class="toolbar-search" id="hub-filter" type="search" aria-label="Search servers" placeholder="Search models, names, or ports…" value="${escapeHtml(hubFilter)}"></div>
+        <select class="toolbar-select" id="hub-state-filter" aria-label="Filter by server status">
+            ${option('all', 'All states', hubStateFilter)}${option('running', 'Running', hubStateFilter)}${option('stopped', 'Stopped', hubStateFilter)}${option('healthy', 'Healthy', hubStateFilter)}${option('loading', 'Loading', hubStateFilter)}${option('unreachable', 'Unreachable', hubStateFilter)}
+        </select>
+        <button class="toolbar-toggle" id="hub-vision-filter" aria-pressed="${hubVisionOnly}" title="Show only configs with a vision projector (mmproj)">${eyeIcon(16)}<span>Vision only</span></button>
+        <div class="view-switch" role="group" aria-label="Server layout">
+            <button class="view-option" data-view="cards" aria-pressed="${hubView !== 'table'}" title="Card view">${gridIcon(16)}<span>Cards</span></button>
+            <button class="view-option" data-view="table" aria-pressed="${hubView === 'table'}" title="Table view">${listIcon(16)}<span>Table</span></button>
+        </div>
+    </div>`;
 }
 
 function renderHubPage() {
-    const header = `
-        <div class="page-header">
-            <div>
-                <h1>Server Hub</h1>
-                <p class="subtitle">Monitor and control your llama.cpp servers</p>
-            </div>
-        </div>
-        ${renderResourceSection()}`;
+    return `<div class="page-header overview-header">
+        <div><span class="eyebrow">Your local AI workspace</span><h1>Server overview</h1><p class="subtitle">Your models, resources, and next conversation.</p></div>
+        <button class="btn btn-primary" id="hub-new-config">${plusIcon(16)} New configuration</button>
+    </div>
+    <div id="hub-resources">${renderResourceSection()}</div>
+    <div class="collection-heading"><h2>Model library <span class="count-pill" id="server-count">${servers.length}</span></h2><span id="running-count" class="collection-caption">${servers.filter(s => s.running).length} running</span></div>
+    ${renderToolbar()}<div id="hub-results">${renderHubResults()}</div>`;
+}
 
-    if (servers.length === 0) {
-        return header + `
-            <div class="empty-state">
-                <div class="empty-state-icon">${serverIcon(36)}</div>
-                <h3>No Servers Configured</h3>
-                <p>Create your first server configuration to start managing llama.cpp instances.</p>
-                <a href="#configs" class="btn btn-primary">${plusIcon(16)} Create Configuration</a>
-            </div>`;
-    }
-
+function renderHubResults() {
+    if (!serverDataLoaded && connectionErrors.has('servers')) return '<div class="empty-state"><h3>Waiting for connection</h3><p>Your configurations will appear when the workspace reconnects.</p></div>';
+    if (!servers.length) return `<div class="empty-state"><div class="empty-state-icon">${serverIcon(32)}</div><h3>A home for your models</h3><p>Add your first GGUF configuration to start a server, test a prompt, and follow its performance.</p><button class="btn btn-primary" data-action="new">${plusIcon(16)} Add a model</button></div>`;
     const visible = filteredServers();
-    const cards = visible.map(renderServerCard).join('');
-
-    return `
-        ${header}
-        ${renderToolbar()}
-        ${visible.length ? `<div class="server-grid">${cards}</div>` : '<div class="empty-state"><h3>No Matches</h3><p>Adjust the filter to show more servers.</p></div>'}`;
+    if (!visible.length) return '<div class="empty-state"><h3>No matching models</h3><p>Try another name or clear your filters.</p><button class="btn btn-ghost" data-action="reset-filter">Clear filters</button></div>';
+    const groups = [['Running', visible.filter(s => s.running)], ['Stopped', visible.filter(s => !s.running)]];
+    return groups.filter(([, items]) => items.length).map(([label, items]) => `<section class="server-section" aria-label="${label} servers"><div class="server-section-heading"><span class="status-dot ${label.toLowerCase()}"></span><h3>${label}</h3><span>${items.length}</span></div>${hubView === 'table' ? renderServerTable(items) : `<div class="server-grid">${items.map(renderServerCard).join('')}</div>`}</section>`).join('');
 }
 
 function renderResourceSection() {
-    if (!gpus.length && !ram) return '';
-    return `
-        <div class="resource-grid" aria-label="System status">
-            ${ram ? renderRamCard(ram) : ''}
-            ${gpus.map(renderGpuCard).join('')}
-        </div>`;
+    if (!gpus.length && !ram) return '<div class="resource-summary resource-placeholder"><span class="status-dot"></span>Hardware telemetry appears here when available.</div>';
+    const metrics = [];
+    if (ram) metrics.push(renderResourceMetric('System memory', formatVram(ram.used_mb, ram.total_mb), ram.percent_used, `${formatMb(ram.available_mb)} available`, serverIcon(18)));
+    gpus.forEach(gpu => metrics.push(renderResourceMetric(gpu.name || `GPU ${gpu.index}`, formatVram(gpu.vram_used_mb, gpu.vram_total_mb), gpu.gpu_util_percent, `${gpu.gpu_util_percent ?? '—'}% load · ${gpu.temperature_c ?? '—'}°C`, chipIcon(18))));
+    return `<div class="resource-summary" aria-label="System resources">${metrics.join('')}</div>`;
 }
 
-function renderRamCard(memory) {
-    const used = numberOrNull(memory.used_mb);
-    const total = numberOrNull(memory.total_mb);
-    const available = numberOrNull(memory.available_mb);
-    const percent = numberOrNull(memory.percent_used);
-    const swapUsed = numberOrNull(memory.swap_used_mb);
-    const swapTotal = numberOrNull(memory.swap_total_mb);
-    return `
-        <div class="resource-card ram-card">
-            <div class="resource-card-header">
-                <div>
-                    <div class="resource-title">System RAM</div>
-                    <div class="resource-subtitle">${available != null ? `${formatMb(available)} available` : 'Memory'}</div>
-                </div>
-                <div class="resource-load">${percent != null ? `${percent}%` : 'n/a'}</div>
-            </div>
-            <div class="resource-meter" title="RAM used">
-                <span style="width: ${percent != null ? Math.max(0, Math.min(100, percent)) : 0}%"></span>
-            </div>
-            <div class="resource-details">
-                <div>
-                    <span class="label">RAM</span>
-                    <span class="value">${formatVram(used, total)}</span>
-                </div>
-                <div>
-                    <span class="label">Used</span>
-                    <span class="value">${percent != null ? `${percent}%` : 'n/a'}</span>
-                </div>
-                <div>
-                    <span class="label">Available</span>
-                    <span class="value">${available != null ? formatMb(available) : 'n/a'}</span>
-                </div>
-                <div>
-                    <span class="label">Swap</span>
-                    <span class="value">${formatVram(swapUsed, swapTotal)}</span>
-                </div>
-            </div>
-        </div>`;
+function renderResourceMetric(title, value, percent, detail, icon) {
+    return `<div class="resource-metric"><div class="metric-symbol">${icon}</div><div class="metric-content"><div class="metric-heading"><span title="${escapeHtml(title)}">${escapeHtml(title)}</span><strong>${escapeHtml(value)}</strong></div><div class="metric-bottom"><div class="resource-meter"><span style="width:${Math.max(0, Math.min(100, percent || 0))}%"></span></div><span>${escapeHtml(detail)}</span></div></div></div>`;
 }
 
-function renderGpuCard(gpu) {
-    const used = numberOrNull(gpu.vram_used_mb);
-    const total = numberOrNull(gpu.vram_total_mb);
-    const vramPercent = used != null && total ? Math.min(100, Math.round((used / total) * 100)) : null;
-    const load = numberOrNull(gpu.gpu_util_percent);
-    const temp = numberOrNull(gpu.temperature_c);
-    const power = numberOrNull(gpu.power_draw_w);
-    const powerLimit = numberOrNull(gpu.power_limit_w);
-    return `
-        <div class="resource-card gpu-card">
-            <div class="resource-card-header">
-                <div>
-                    <div class="resource-title">${escapeHtml(gpu.name || `GPU ${gpu.index}`)}</div>
-                    <div class="resource-subtitle">${escapeHtml(gpu.vendor || 'GPU')} ${gpu.index != null ? `#${gpu.index}` : ''}</div>
-                </div>
-                <div class="resource-load">${load != null ? `${load}%` : 'n/a'}</div>
-            </div>
-            <div class="resource-meter" title="GPU load">
-                <span style="width: ${load != null ? Math.max(0, Math.min(100, load)) : 0}%"></span>
-            </div>
-            <div class="resource-details">
-                <div>
-                    <span class="label">VRAM</span>
-                    <span class="value">${formatVram(used, total)}</span>
-                </div>
-                <div>
-                    <span class="label">Memory</span>
-                    <span class="value">${vramPercent != null ? `${vramPercent}%` : 'n/a'}</span>
-                </div>
-                <div>
-                    <span class="label">Temp</span>
-                    <span class="value">${temp != null ? `${temp} C` : 'n/a'}</span>
-                </div>
-                <div>
-                    <span class="label">Power</span>
-                    <span class="value">${formatPower(power, powerLimit)}</span>
-                </div>
-            </div>
-        </div>`;
+function serverActionButton(server, action, label, icon, className = 'btn btn-ghost btn-sm') {
+    const id = escapeHtml(server.config.id);
+    const pending = pendingServerActions.get(server.config.id);
+    const busy = ['start', 'stop', 'restart'].includes(action) && pending;
+    return `<button class="${className}" data-action="${action}" data-id="${id}" data-focus-key="${id}-${action}" ${busy ? 'disabled aria-busy="true"' : ''}>${icon}${busy && pending === action ? 'Working…' : label}</button>`;
 }
 
-function renderServerCard(s) {
-    const c = s.config;
-    const modelName = c.model_path.split('/').pop();
-    const health = s.health || (s.running ? 'running' : 'stopped');
-    const recent = (s.recent_output || []).slice(-4);
-    const showRecent = s.running && recent.length > 0 && health !== 'healthy';
-    const warnings = s.validation_warnings || [];
-    const startup = s.startup_elapsed_seconds != null ? `${s.startup_elapsed_seconds}s` : 'n/a';
-    const usage = tokenUsage(s);
+function renderServerActions(server) {
+    const external = server.running && server.pid == null;
+    return `${server.running ? serverActionButton(server, 'stop', external ? 'Untrack' : 'Stop', stopIcon(14), 'btn btn-stop btn-sm') : serverActionButton(server, 'start', 'Start', playIcon(14), 'btn btn-primary btn-sm')}
+        ${serverActionButton(server, 'chat', 'Chat', chatIcon(14))}
+        ${serverActionButton(server, 'logs', 'Logs', terminalIcon(14))}
+        <details class="action-menu" data-menu-id="${escapeHtml(server.config.id)}"><summary class="btn btn-ghost btn-icon btn-sm" aria-label="More actions for ${escapeHtml(server.config.name)}" data-focus-key="${escapeHtml(server.config.id)}-more" title="More actions">${moreIcon(18)}</summary><div class="action-menu-items">
+            ${serverActionButton(server, 'details', 'Model details', serverIcon(14))}
+            ${server.running ? serverActionButton(server, 'restart', 'Restart server', restartIcon(14)) : ''}
+            ${serverActionButton(server, 'copy-url', 'Copy server URL', copyIcon(14))}
+            ${serverActionButton(server, 'test', 'Test endpoint', checkIcon(14))}
+            ${serverActionButton(server, 'quick-benchmark', 'Quick benchmark', benchmarkIcon(14))}
+            ${serverActionButton(server, 'benchmark', 'Open benchmarks', benchmarkIcon(14))}
+        </div></details>`;
+}
 
-    return `
-        <div class="server-card ${health}" data-id="${c.id}">
-            <div class="card-header">
-                <div>
-                    <div class="card-title">${escapeHtml(c.name)}</div>
-                    <div class="card-subtitle">${escapeHtml(modelName)}</div>
-                </div>
-                <div class="card-status ${health}" title="${escapeHtml(s.status_detail || health)}">
-                    <span class="status-dot"></span>
-                    ${labelForHealth(health)}
-                </div>
-            </div>
-            <div class="card-details">
-                <div class="card-detail">
-                    <span class="label">Address</span>
-                    <span class="value mono">${escapeHtml(c.host)}:${c.port}</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">GPU</span>
-                    <span class="value">${c.n_gpu_layers === -1 ? 'All layers' : c.n_gpu_layers + ' layers'}</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">Context</span>
-                    <span class="value">${c.ctx_size.toLocaleString()} tokens</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">Last Started</span>
-                    <span class="value">${relativeTime(c.last_started_at)}</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">Startup</span>
-                    <span class="value">${startup}</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">Input</span>
-                    <span class="value">${formatTokens(usage.prompt_tokens)}</span>
-                </div>
-                <div class="card-detail">
-                    <span class="label">Output</span>
-                    <span class="value">${formatTokens(usage.completion_tokens)}</span>
-                </div>
-            </div>
-            ${warnings.length ? `<div class="card-warning">${escapeHtml(warnings[0])}</div>` : ''}
-            ${s.failure_summary ? `<div class="card-warning">${escapeHtml(s.failure_summary)}</div>` : ''}
-            ${showRecent ? `<div class="card-output">${recent.map(line => `<div>${escapeHtml(line || ' ')}</div>`).join('')}</div>` : ''}
-            <div class="card-actions">
-                ${s.running
-                    ? `<button class="btn btn-danger btn-sm stop-btn" data-id="${c.id}">${stopIcon(14)} Stop</button>
-                       <button class="btn btn-ghost btn-sm restart-btn" data-id="${c.id}">${restartIcon(14)} Restart</button>`
-                    : `<button class="btn btn-primary btn-sm start-btn" data-id="${c.id}">${playIcon(14)} Start</button>`}
-                <button class="btn btn-ghost btn-sm copy-url-btn" data-url="${serverUrl(c)}">${copyIcon(14)} URL</button>
-                <button class="btn btn-ghost btn-sm details-btn" data-id="${c.id}">Details</button>
-                <button class="btn btn-ghost btn-sm test-endpoint-btn" data-id="${c.id}">Test</button>
-                <button class="btn btn-ghost btn-sm benchmark-btn" data-id="${c.id}">Benchmark</button>
-            </div>
-        </div>`;
+function renderServerCard(server) {
+    const c = server.config;
+    const health = server.health || (server.running ? 'running' : 'stopped');
+    const usage = tokenUsage(server);
+    const warning = server.failure_summary || server.validation_warnings?.[0];
+    return `<article class="server-card ${health}" data-id="${escapeHtml(c.id)}">
+        <div class="card-header"><div class="model-identity"><span class="model-avatar">${escapeHtml(c.name.slice(0, 2).toUpperCase())}</span><div><h3 class="card-title">${escapeHtml(c.name)}</h3><div class="card-subtitle" title="${escapeHtml(c.model_path)}">${escapeHtml(c.model_path.split('/').pop())}</div></div></div><span class="card-status ${health}" title="${escapeHtml(server.status_detail || health)}"><span class="status-dot"></span>${labelForHealth(health)}</span></div>
+        <div class="card-address">${serverIcon(13)}<span>${escapeHtml(c.host)}:${c.port}</span>${server.model_size_label ? `<span class="model-size">${escapeHtml(server.model_size_label)}</span>` : ''}</div>
+        <div class="card-details">
+            <div class="card-detail"><span class="label">Context window</span><span class="value">${formatTokens(c.ctx_size)} <small>tokens</small></span></div>
+            <div class="card-detail"><span class="label">Output limit</span><span class="value">${formatOutputLimit(c.n_predict)}</span></div>
+            <div class="card-detail"><span class="label">GPU offload</span><span class="value">${c.n_gpu_layers === -1 ? 'All layers' : `${c.n_gpu_layers} layers`}</span></div>
+            <div class="card-detail"><span class="label">CPU threads</span><span class="value">${c.threads}</span></div>
+        </div>
+        ${warning ? `<div class="card-warning">${escapeHtml(warning)}</div>` : ''}
+        ${health === 'loading' ? `<div class="startup-note"><span class="loading-mark small"></span>Loading model${server.startup_elapsed_seconds != null ? ` · ${server.startup_elapsed_seconds}s` : ''}</div>` : ''}
+        <div class="card-usage"><span>Tokens used</span><span title="Input tokens used">${formatTokens(usage.prompt_tokens)} in</span><span title="Output tokens used">${formatTokens(usage.completion_tokens)} out</span></div>
+        <div class="card-actions">${renderServerActions(server)}</div>
+    </article>`;
+}
+
+function renderServerTable(items) {
+    return `<div class="server-table-wrap" tabindex="0" aria-label="Scrollable server table"><table class="server-table"><thead><tr><th scope="col">Model</th><th scope="col">Status</th><th scope="col">Context</th><th scope="col">Output limit</th><th scope="col">Tokens used</th><th scope="col">Actions</th></tr></thead><tbody>${items.map(server => `<tr><td><strong>${escapeHtml(server.config.name)}</strong><small>${escapeHtml(server.config.host)}:${server.config.port}</small></td><td><span class="card-status ${server.health}"><span class="status-dot"></span>${labelForHealth(server.health)}</span></td><td>${formatTokens(server.config.ctx_size)}</td><td>${formatOutputLimit(server.config.n_predict)}</td><td>${formatTokens(tokenUsage(server).total_tokens)}</td><td><div class="table-actions">${renderServerActions(server)}</div></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function refreshHubSurface() {
+    if (currentPage !== 'hub') return;
+    replaceSurface('hub-resources', renderResourceSection());
+    replaceSurface('hub-results', renderHubResults());
+    const count = document.getElementById('server-count');
+    if (count) count.textContent = servers.length;
+    const running = document.getElementById('running-count');
+    if (running) running.textContent = `${servers.filter(s => s.running).length} running`;
 }
 
 function bindHubEvents() {
     bindToolbar();
-    bindServerAction('.start-btn', 'Starting...', id => apiPost(`/configs/${id}/start`), 'Server started successfully');
-    bindServerAction('.stop-btn', 'Stopping...', id => apiPost(`/configs/${id}/stop`), 'Server stopped');
-    bindServerAction('.restart-btn', 'Restarting...', id => apiPost(`/configs/${id}/restart`), 'Server restarted');
-    document.querySelectorAll('.copy-url-btn').forEach(btn => {
-        btn.addEventListener('click', () => copyText(btn.dataset.url, 'Server URL copied'));
-    });
-    document.querySelectorAll('.details-btn').forEach(btn => {
-        btn.addEventListener('click', () => showDetails(btn.dataset.id));
-    });
-    document.querySelectorAll('.test-endpoint-btn').forEach(btn => {
-        btn.addEventListener('click', () => testEndpoint(btn.dataset.id));
-    });
-    document.querySelectorAll('.benchmark-btn').forEach(btn => {
-        btn.addEventListener('click', () => benchmarkEndpoint(btn.dataset.id));
-    });
+    document.getElementById('hub-new-config').onclick = () => openModal();
+    document.getElementById('hub-results').onclick = async event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const action = button.dataset.action;
+        if (action === 'new') return openModal();
+        if (action === 'reset-filter') {
+            hubFilter = ''; hubStateFilter = 'all'; hubVisionOnly = false;
+            document.getElementById('hub-filter').value = '';
+            document.getElementById('hub-state-filter').value = 'all';
+            document.getElementById('hub-vision-filter').setAttribute('aria-pressed', 'false');
+            return refreshHubSurface();
+        }
+        const id = button.dataset.id;
+        const server = servers.find(item => item.config.id === id);
+        if (!server) return;
+        const menu = button.closest('details');
+        if (menu) { menu.open = false; menu.querySelector('summary').focus(); }
+        if (action === 'chat' || action === 'logs' || action === 'benchmark') return openServerPage(id, action === 'logs' ? 'terminal' : action);
+        if (action === 'details') return showDetails(id);
+        if (action === 'copy-url') return copyText(serverUrl(server.config), 'Server URL copied');
+        if (action === 'test') return testEndpoint(id);
+        if (action === 'quick-benchmark') return benchmarkEndpoint(id);
+        if (!['start', 'stop', 'restart'].includes(action) || pendingServerActions.has(id)) return;
+        pendingServerActions.set(id, action);
+        refreshHubSurface();
+        try {
+            await apiPost(`/configs/${encodeURIComponent(id)}/${action}`);
+            showToast(action === 'stop' ? 'Server stopped or untracked' : 'Server is starting', 'success');
+        } catch (error) { showToast(error.message, 'error'); }
+        finally {
+            pendingServerActions.delete(id);
+            await fetchServers();
+            refreshHubSurface();
+        }
+    };
 }
 
 function bindToolbar() {
-    document.getElementById('hub-filter')?.addEventListener('input', e => {
-        hubFilter = e.target.value;
-        document.getElementById('main-content').innerHTML = renderHubPage();
-        bindHubEvents();
+    document.getElementById('hub-filter')?.addEventListener('input', event => { hubFilter = event.target.value; refreshHubSurface(); });
+    document.getElementById('hub-state-filter')?.addEventListener('change', event => { hubStateFilter = event.target.value; refreshHubSurface(); });
+    document.getElementById('hub-vision-filter')?.addEventListener('click', event => {
+        hubVisionOnly = !hubVisionOnly;
+        event.currentTarget.setAttribute('aria-pressed', String(hubVisionOnly));
+        refreshHubSurface();
     });
-    document.getElementById('hub-state-filter')?.addEventListener('change', e => {
-        hubStateFilter = e.target.value;
-        document.getElementById('main-content').innerHTML = renderHubPage();
-        bindHubEvents();
-    });
-}
-
-function bindServerAction(selector, progressText, action, successText) {
-    document.querySelectorAll(selector).forEach(btn => {
-        btn.addEventListener('click', async () => {
-            btn.disabled = true;
-            btn.textContent = progressText;
-            try {
-                await action(btn.dataset.id);
-                showToast(successText, 'success');
-            } catch (e) {
-                showToast(e.message, 'error');
-            }
-            render();
-        });
-    });
+    document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
+        hubView = button.dataset.view;
+        writePreference('hub-view', hubView);
+        document.querySelectorAll('[data-view]').forEach(item => item.setAttribute('aria-pressed', String(item.dataset.view === hubView)));
+        refreshHubSurface();
+    }));
 }
 
 function renderConfigsPage() {
@@ -498,16 +561,19 @@ function renderConfigsPage() {
                         <span title="${escapeHtml(c.model_path)}">${escapeHtml(modelName)}</span>
                         <span>${escapeHtml(c.host)}:${c.port}</span>
                         <span>GPU: ${c.n_gpu_layers === -1 ? 'All' : c.n_gpu_layers}</span>
-                        <span>Ctx: ${c.ctx_size.toLocaleString()}</span>
+                        <span>Context: ${formatTokens(c.ctx_size)}</span>
+                        <span>Output limit: ${formatOutputLimit(c.n_predict)}</span>
                         <span>Updated: ${relativeTime(c.updated_at)}</span>
                     </div>
                 </div>
                 <div class="config-item-actions">
-                    <button class="btn btn-ghost btn-sm copy-command-btn" data-id="${c.id}">${copyIcon(14)} Command</button>
-                    <button class="btn btn-ghost btn-sm export-one-btn" data-id="${c.id}">${downloadIcon(14)} Export</button>
-                    <button class="btn btn-ghost btn-sm duplicate-btn" data-id="${c.id}">${copyIcon(14)} Duplicate</button>
-                    <button class="btn btn-ghost btn-sm edit-btn" data-id="${c.id}" ${locked}>${editIcon(14)} Edit</button>
-                    <button class="btn btn-danger btn-sm delete-btn" data-id="${c.id}" data-name="${escapeHtml(c.name)}" ${locked}>${trashIcon(14)} Delete</button>
+                    <button class="btn btn-ghost btn-sm edit-btn" data-id="${escapeHtml(c.id)}" ${locked}>${editIcon(14)} Edit</button>
+                    <button class="btn btn-ghost btn-sm duplicate-btn" data-id="${escapeHtml(c.id)}">${copyIcon(14)} Duplicate</button>
+                    <details class="action-menu"><summary class="btn btn-ghost btn-icon btn-sm" title="More actions" aria-label="More actions for ${escapeHtml(c.name)}">${moreIcon(18)}</summary><div class="action-menu-items">
+                        <button class="btn btn-ghost btn-sm copy-command-btn" data-id="${escapeHtml(c.id)}">${copyIcon(14)} Copy command</button>
+                        <button class="btn btn-ghost btn-sm export-one-btn" data-id="${escapeHtml(c.id)}">${downloadIcon(14)} Export JSON</button>
+                        <button class="btn btn-danger btn-sm delete-btn" data-id="${escapeHtml(c.id)}" data-name="${escapeHtml(c.name)}" ${locked}>${trashIcon(14)} Delete configuration</button>
+                    </div></details>
                 </div>
             </div>`;
     }).join('');
@@ -572,20 +638,28 @@ function bindConfigEvents() {
 }
 
 async function scanModels() {
-    const directory = prompt('Directory to scan for .gguf and .mmproj files', settings?.model_scan_directory || '');
-    if (!directory) return;
-    try {
-        const results = await apiGet(`/models/scan?directory=${encodeURIComponent(directory)}`);
-        const models = results.filter(item => item.kind === 'model');
-        const mmprojs = results.filter(item => item.kind === 'mmproj');
-        if (!models.length) {
-            showToast('No models found', 'info');
-            return;
-        }
-        showScannerPreview(models, mmprojs);
-    } catch (e) {
-        showToast('Scan failed: ' + e.message, 'error');
-    }
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `<div class="confirm-dialog scan-directory-dialog"><h3>Discover local models</h3><p>Choose a folder to scan for GGUF models and vision projectors.</p><form id="scan-directory-form"><div class="form-group"><label for="scan-directory">Model folder</label><input id="scan-directory" type="text" value="${escapeHtml(settings?.model_scan_directory || '')}" placeholder="/path/to/models" required><span class="field-error" id="scan-directory-error" role="alert"></span></div><div class="confirm-actions"><button type="button" class="btn btn-ghost confirm-cancel">Cancel</button><button type="submit" class="btn btn-primary">Scan folder</button></div></form></div>`;
+    document.body.appendChild(overlay);
+    activateDialog(overlay, () => dismissDialog(overlay));
+    overlay.querySelector('.confirm-cancel').onclick = () => dismissDialog(overlay);
+    overlay.querySelector('form').onsubmit = async event => {
+        event.preventDefault();
+        const button = overlay.querySelector('[type="submit"]');
+        const error = overlay.querySelector('#scan-directory-error');
+        button.disabled = true; button.textContent = 'Scanning…'; error.textContent = '';
+        try {
+            const directory = overlay.querySelector('#scan-directory').value.trim();
+            const results = await apiGet(`/models/scan?directory=${encodeURIComponent(directory)}`);
+            if (!overlay.isConnected) return;
+            const models = results.filter(item => item.kind === 'model');
+            if (!models.length) { error.textContent = 'No models found. Try another folder.'; return; }
+            dismissDialog(overlay);
+            showScannerPreview(models, results.filter(item => item.kind === 'mmproj'));
+        } catch (failure) { error.textContent = failure.message; }
+        finally { button.disabled = false; button.textContent = 'Scan folder'; }
+    };
 }
 
 function showScannerPreview(models, mmprojs) {
@@ -627,7 +701,8 @@ function showScannerPreview(models, mmprojs) {
             </div>
         </div>`;
     document.body.appendChild(overlay);
-    overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    activateDialog(overlay, () => dismissDialog(overlay));
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => dismissDialog(overlay));
     overlay.querySelector('.scanner-create').addEventListener('click', async () => {
         const configs = rows.flatMap((row, index) => {
             const checked = overlay.querySelector(`.scan-check[data-index="${index}"]`).checked;
@@ -649,7 +724,7 @@ function showScannerPreview(models, mmprojs) {
         });
         if (!configs.length) return;
         await apiPost('/configs/import', configs);
-        overlay.remove();
+        dismissDialog(overlay);
         showToast(`Created ${configs.length} configs`, 'success');
         render();
     });
@@ -697,6 +772,7 @@ function showDetails(configId) {
                 <dt>Size</dt><dd>${escapeHtml(server.model_size_label || 'Unknown')}</dd>
                 <dt>Address</dt><dd>${escapeHtml(serverUrl(c))}</dd>
                 <dt>Preset</dt><dd>${escapeHtml(c.preset || 'custom')}</dd>
+                <dt>Output token limit</dt><dd>${formatOutputLimit(c.n_predict)}</dd>
                 <dt>Health</dt><dd>${escapeHtml(labelForHealth(server.health))}${server.status_detail ? ` - ${escapeHtml(server.status_detail)}` : ''}</dd>
                 <dt>Startup</dt><dd>${server.startup_elapsed_seconds ?? 'n/a'} seconds</dd>
                 <dt>Input tokens</dt><dd>${formatTokens(usage.prompt_tokens)}</dd>
@@ -717,12 +793,13 @@ function showDetails(configId) {
             </div>
         </div>`;
     document.body.appendChild(overlay);
-    overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    activateDialog(overlay, () => dismissDialog(overlay));
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => dismissDialog(overlay));
     overlay.querySelector('.copy-token-url-btn').addEventListener('click', () => copyText(trackedChatUrl(c), 'Proxy URL copied'));
     overlay.querySelector('.reset-token-usage-btn').addEventListener('click', async () => {
         try {
             await apiPost(`/configs/${configId}/tokens/reset`);
-            overlay.remove();
+            dismissDialog(overlay);
             showToast('Token usage reset', 'info');
             render();
         } catch (e) {
@@ -730,7 +807,7 @@ function showDetails(configId) {
         }
     });
     overlay.addEventListener('click', e => {
-        if (e.target === overlay) overlay.remove();
+        if (e.target === overlay) dismissDialog(overlay);
     });
 }
 
@@ -810,13 +887,13 @@ function renderTerminalPage() {
     return header + `
         <div class="terminal-container">
             <div class="terminal-header terminal-header-wrap">
-                <select class="terminal-selector" id="terminal-server-select">${options}</select>
+                <select class="terminal-selector" id="terminal-server-select" aria-label="Terminal server">${options}</select>
                 <div class="terminal-status-badge stopped" id="terminal-status">
                     <span class="status-dot"></span> <span id="terminal-status-text">Stopped</span>
                 </div>
-                <input class="terminal-filter" id="terminal-filter" type="search" placeholder="Filter output">
-                <button class="btn btn-ghost btn-sm" id="terminal-pause-btn">Pause</button>
-                <button class="btn btn-ghost btn-sm" id="terminal-autoscroll-btn">Auto-scroll On</button>
+                <input class="terminal-filter" id="terminal-filter" type="search" aria-label="Filter terminal output" placeholder="Filter output">
+                <button class="btn btn-ghost btn-sm" id="terminal-pause-btn">${terminalPaused ? 'Resume' : 'Pause'}</button>
+                <button class="btn btn-ghost btn-sm" id="terminal-autoscroll-btn" aria-pressed="${terminalAutoScroll}">Auto-scroll ${terminalAutoScroll ? 'On' : 'Off'}</button>
                 <button class="btn btn-ghost btn-sm" id="terminal-copy-btn">${copyIcon(14)} Copy</button>
                 <button class="btn btn-ghost btn-sm" id="terminal-download-btn">${downloadIcon(14)} Logs</button>
                 <button class="btn btn-ghost btn-sm" id="terminal-clear-btn">Clear</button>
@@ -876,9 +953,9 @@ function renderChatPage() {
     const messages = chatMessages();
 
     return header + `
-        <section class="chat-panel">
+        <section class="chat-panel" data-config-id="${escapeHtml(chatConfigId)}">
             <div class="chat-toolbar">
-                <select class="chat-server-select" id="chat-server-select">${options}</select>
+                <select class="chat-server-select" id="chat-server-select" aria-label="Chat model">${options}</select>
                 <div class="terminal-status-badge ${server?.health || 'stopped'}">
                     <span class="status-dot"></span> ${labelForHealth(server?.health || 'stopped')}
                 </div>
@@ -886,22 +963,24 @@ function renderChatPage() {
                     <span>Input ${formatTokens(usage.prompt_tokens)}</span>
                     <span>Output ${formatTokens(usage.completion_tokens)}</span>
                 </div>
-                <button class="btn btn-ghost btn-sm" id="chat-clear-btn" ${messages.length ? '' : 'disabled'}>Clear</button>
+                <button class="btn btn-ghost btn-sm" id="chat-clear-btn" ${messages.length && !chatSending ? '' : 'disabled'}>Clear</button>
             </div>
             <div class="chat-window" id="chat-window">
                 ${renderChatMessages(messages)}
             </div>
             <form class="chat-composer" id="chat-form">
-                <textarea id="chat-input" rows="3" placeholder="Message the selected model" ${chatSending ? 'disabled' : ''}></textarea>
-                <button class="btn btn-primary" id="chat-send-btn" type="submit" ${chatSending ? 'disabled' : ''}>${chatSending ? 'Sending...' : 'Send'}</button>
+                <textarea id="chat-input" rows="3" aria-label="Message" placeholder="Message the selected model…">${escapeHtml(chatDrafts.get(chatConfigId) || '')}</textarea>
+                <button class="btn ${chatSending ? 'btn-danger' : 'btn-primary'}" id="chat-send-btn" type="submit">${chatSending ? 'Stop' : 'Send'}</button>
             </form>
         </section>`;
 }
 
 function bindChatEvents() {
+    document.getElementById('chat-input')?.addEventListener('input', event => chatDrafts.set(chatConfigId, event.target.value));
     document.getElementById('chat-settings-btn')?.addEventListener('click', openChatSettings);
     document.getElementById('chat-server-select')?.addEventListener('change', e => {
-        chatConfigId = e.target.value;
+        capturePageState();
+        rememberConfig(e.target.value);
         render();
     });
     document.getElementById('chat-clear-btn')?.addEventListener('click', () => {
@@ -909,57 +988,254 @@ function bindChatEvents() {
         renderChatOnly();
     });
     document.getElementById('chat-form')?.addEventListener('submit', sendChatMessage);
+    // toggle does not bubble, so capture it to remember which thought processes are expanded across re-renders.
+    document.getElementById('chat-window')?.addEventListener('toggle', e => {
+        const details = e.target;
+        if (!details.matches?.('.chat-reasoning')) return;
+        // data-expected records the state we set; anything else came from the user.
+        if (String(details.open) === details.dataset.expected) return;
+        details.dataset.expected = String(details.open);
+        const message = chatMessages()[Number(details.dataset.index)];
+        if (message) message.reasoningOpen = details.open;
+    }, true);
     document.getElementById('chat-input')?.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            document.getElementById('chat-form')?.requestSubmit();
+            // Enter never stops a reply; only the Stop button does.
+            if (!chatSending) document.getElementById('chat-form')?.requestSubmit();
         }
     });
-    scrollChatToBottom();
+    document.getElementById('chat-window')?.addEventListener('click', e => {
+        const button = e.target.closest?.('.md-copy');
+        if (button) copyText(button.closest('.md-code-block').querySelector('code').textContent, 'Code copied');
+    });
+    if (!pageStates.has('chat')) scrollChatToBottom();
 }
 
 function renderChatMessages(messages) {
     if (!messages.length) {
         return `<div class="chat-empty">No messages yet</div>`;
     }
-    return messages.map(message => `
-        <div class="chat-message ${message.role} ${message.error ? 'error' : ''}">
+    return messages.map(renderChatMessage).join('');
+}
+
+function renderChatMessage(message, index) {
+    const assistant = message.role === 'assistant';
+    // Streaming replies always carry the reasoning slot so it can fill in place.
+    const reasoning = assistant && (message.reasoning || message.streaming) ? renderChatReasoning(message, index) : '';
+    return `
+        <div class="chat-message ${message.role} ${message.error ? 'error' : ''} ${message.streaming ? 'streaming' : ''}" data-index="${index}">
             <div class="chat-bubble">
-                <div class="chat-role">${message.role === 'assistant' ? 'Model' : 'You'}</div>
-                <div class="chat-content">${escapeHtml(message.content)}</div>
+                <div class="chat-role">${assistant ? 'Model' : 'You'}</div>
+                ${reasoning}
+                ${assistant
+                    ? `<div class="chat-answer">${chatAnswerHtml(message)}</div>`
+                    : `<div class="chat-content">${escapeHtml(message.content)}</div>`}
             </div>
         </div>
-    `).join('');
+    `;
+}
+
+function renderChatReasoning(message, index) {
+    const open = chatReasoningOpen(message);
+    return `
+        <details class="chat-reasoning" data-index="${index}" data-expected="${open}" ${open ? 'open' : ''} ${message.reasoning ? '' : 'hidden'}>
+            <summary><span class="chat-reasoning-label">${chatReasoningLabel(message)}</span><span class="chat-reasoning-size">${chatReasoningSize(message)}</span></summary>
+            <div class="chat-reasoning-content">${escapeHtml(message.reasoning)}</div>
+        </details>`;
+}
+
+// Follow the user's choice; otherwise show thinking live and collapse it once the answer starts.
+function chatReasoningOpen(message) {
+    return message.reasoningOpen ?? (Boolean(message.streaming) && !message.content);
+}
+
+function chatReasoningLabel(message) {
+    if (message.streaming && !message.content) return 'Thinking…';
+    return message.content ? 'Thought process' : 'Thought process (no final answer)';
+}
+
+function chatReasoningSize(message) {
+    const words = String(message.reasoning || '').split(/\s+/).filter(Boolean).length;
+    return `${words.toLocaleString()} ${words === 1 ? 'word' : 'words'}`;
+}
+
+function chatAnswerHtml(message) {
+    if (message.error) return `<div class="chat-content">${escapeHtml(message.content)}</div>`;
+    const notes = [];
+    if (message.interrupted) notes.push(`<div class="chat-note error">Connection lost: ${escapeHtml(message.interrupted)}</div>`);
+    if (message.stopped) notes.push('<div class="chat-note">Stopped</div>');
+    if (message.content) {
+        return `<div class="chat-content markdown">${renderMarkdown(message.content)}</div>${notes.join('')}`;
+    }
+    if (message.streaming) {
+        return `<div class="chat-pending">${message.reasoning ? 'Working on an answer' : 'Waiting for the model'}<span class="chat-dots"><span></span><span></span><span></span></span></div>`;
+    }
+    if (message.reasoning && !message.stopped && !message.interrupted) {
+        return `<div class="chat-no-answer">${message.truncated
+            ? 'The model used its whole output budget on reasoning and never reached a final answer. Raise Maximum Output Tokens in chat settings and try again.'
+            : 'The model returned reasoning but no final answer.'}</div>`;
+    }
+    return notes.join('') || '<div class="chat-no-answer">The model returned an empty response.</div>';
 }
 
 async function sendChatMessage(event) {
     event.preventDefault();
-    if (chatSending || !chatConfigId) return;
+    if (chatSending) {
+        // Only the Stop button submits while a reply streams.
+        if (event.submitter) chatStream?.controller.abort();
+        return;
+    }
+    if (!chatConfigId) return;
 
     const input = document.getElementById('chat-input');
     const content = input?.value.trim();
     if (!content) return;
 
+    const configId = chatConfigId;
     const messages = chatMessages();
     messages.push({ role: 'user', content });
+    const payload = chatRequestPayload(messages);
+    const reply = { role: 'assistant', content: '', reasoning: '', streaming: true };
+    messages.push(reply);
     input.value = '';
+    chatDrafts.set(configId, '');
+    chatStream = { configId, message: reply, controller: new AbortController(), frame: null };
     chatSending = true;
     renderChatOnly();
 
     try {
-        const data = await apiPost(`/configs/${chatConfigId}/v1/chat/completions`, chatRequestPayload(messages));
-        const reply = extractChatReply(data);
-        messages.push({ role: 'assistant', content: reply.content, error: reply.error });
-        await fetchServers({ quiet: true });
+        await streamChatCompletion(configId, payload, reply, chatStream.controller.signal);
+        if (!reply.content && !reply.reasoning) {
+            Object.assign(reply, { content: 'No assistant text found in the response.', error: true });
+        }
     } catch (e) {
-        messages.push({ role: 'assistant', content: `Request failed: ${e.message}`, error: true });
+        if (e.name === 'AbortError') {
+            reply.stopped = true;
+        } else if (!reply.content && !reply.reasoning) {
+            Object.assign(reply, { content: `Request failed: ${e.message}`, error: true });
+        } else {
+            reply.interrupted = e.message;
+        }
     } finally {
+        reply.streaming = false;
+        chatStream = null;
         chatSending = false;
         renderChatOnly();
     }
+    // Usage totals only change once the reply has finished.
+    await fetchServers();
+    renderChatOnly({ focus: false });
 }
 
-function renderChatOnly() {
+async function streamChatCompletion(configId, payload, reply, signal) {
+    const res = await fetch(`${API_BASE}/configs/${configId}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // include_usage makes llama.cpp send token counts in the final chunk for the usage tracker.
+        body: JSON.stringify({ ...payload, stream: true, stream_options: { include_usage: true } }),
+        signal,
+    });
+    if (!res.ok) throw await chatResponseError(res);
+
+    if (!(res.headers.get('content-type') || '').includes('text/event-stream') || !res.body) {
+        // The server ignored stream: true and sent the whole reply at once.
+        Object.assign(reply, extractChatReply(await res.json()));
+        return;
+    }
+
+    const state = { raw: '', separate: '' };
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = done ? '' : events.pop();
+        for (const event of events) applyChatStreamEvent(event, reply, state);
+        if (done) return;
+    }
+}
+
+function applyChatStreamEvent(event, reply, state) {
+    const data = event.split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).replace(/^ /, ''))
+        .join('\n');
+    if (!data || data === '[DONE]') return;
+    let chunk;
+    try {
+        chunk = JSON.parse(data);
+    } catch {
+        return;
+    }
+    if (chunk.error) throw new Error(chunk.error.message || String(chunk.error));
+
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta || {};
+    if (typeof delta.content === 'string') state.raw += delta.content;
+    const reasoningDelta = delta.reasoning_content ?? delta.reasoning;
+    if (typeof reasoningDelta === 'string') state.separate += reasoningDelta;
+    if (choice.finish_reason) reply.truncated = choice.finish_reason === 'length';
+
+    // Re-split the whole text each time: a closing </think> can reclassify everything before it.
+    const split = splitReasoning(state.raw);
+    reply.content = split.content;
+    reply.reasoning = [state.separate.trim(), split.reasoning].filter(Boolean).join('\n\n');
+    scheduleChatStreamRender();
+}
+
+async function chatResponseError(res) {
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === 'string' ? body.detail : '';
+    return new Error(body?.error?.message || detail || `HTTP ${res.status} ${res.statusText}`.trim());
+}
+
+function scheduleChatStreamRender() {
+    if (!chatStream || chatStream.frame) return;
+    chatStream.frame = requestAnimationFrame(() => {
+        if (!chatStream) return;
+        chatStream.frame = null;
+        updateStreamingMessage();
+    });
+}
+
+// Patch only the streaming bubble so clicks, selection, and scroll elsewhere survive each token.
+function updateStreamingMessage() {
+    const stream = chatStream;
+    const panel = document.querySelector('.chat-panel');
+    if (!stream || !panel || panel.dataset.configId !== stream.configId) return;
+    const index = (chatMessagesByConfig[stream.configId] || []).indexOf(stream.message);
+    const element = panel.querySelector(`.chat-message[data-index="${index}"]`);
+    if (!element) return;
+
+    const message = stream.message;
+    const win = panel.querySelector('#chat-window');
+    const followChat = win.scrollHeight - win.scrollTop - win.clientHeight < 48;
+
+    const details = element.querySelector('.chat-reasoning');
+    if (details) {
+        details.hidden = !message.reasoning;
+        details.querySelector('.chat-reasoning-label').textContent = chatReasoningLabel(message);
+        details.querySelector('.chat-reasoning-size').textContent = chatReasoningSize(message);
+        const body = details.querySelector('.chat-reasoning-content');
+        const followReasoning = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+        body.textContent = message.reasoning;
+        if (followReasoning) body.scrollTop = body.scrollHeight;
+        // Skip while a user toggle is still pending so it is not undone.
+        const open = chatReasoningOpen(message);
+        if (String(details.open) === details.dataset.expected && details.open !== open) {
+            details.dataset.expected = String(open);
+            details.open = open;
+        }
+    }
+    element.querySelector('.chat-answer').innerHTML = chatAnswerHtml(message);
+    if (followChat) win.scrollTop = win.scrollHeight;
+}
+
+function renderChatOnly({ focus = true } = {}) {
     const panel = document.querySelector('.chat-panel');
     if (!panel) return;
     const server = chatServer();
@@ -969,13 +1245,13 @@ function renderChatOnly() {
         <span>Input ${formatTokens(usage.prompt_tokens)}</span>
         <span>Output ${formatTokens(usage.completion_tokens)}</span>`;
     panel.querySelector('#chat-window').innerHTML = renderChatMessages(messages);
-    panel.querySelector('#chat-clear-btn').disabled = messages.length === 0;
-    panel.querySelector('#chat-send-btn').disabled = chatSending;
-    panel.querySelector('#chat-send-btn').textContent = chatSending ? 'Sending...' : 'Send';
-    const input = panel.querySelector('#chat-input');
-    input.disabled = chatSending;
+    panel.querySelector('#chat-clear-btn').disabled = messages.length === 0 || chatSending;
+    const button = panel.querySelector('#chat-send-btn');
+    button.textContent = chatSending ? 'Stop' : 'Send';
+    button.classList.toggle('btn-danger', chatSending);
+    button.classList.toggle('btn-primary', !chatSending);
     scrollChatToBottom();
-    if (!chatSending) input.focus();
+    if (focus && !chatSending) panel.querySelector('#chat-input').focus();
 }
 
 function openChatSettings() {
@@ -989,6 +1265,7 @@ function openChatSettings() {
                     <div class="form-group">
                         <label for="chat-setting-max-tokens">Maximum Output Tokens</label>
                         <input type="number" id="chat-setting-max-tokens" min="1" step="1" value="${escapeHtml(chatRequestSettings.maxTokens)}">
+                        <span class="form-hint">Config limit: ${formatOutputLimit(chatServer()?.config.n_predict)}. Smaller request limits still apply.</span>
                     </div>
                     <div class="form-group">
                         <label for="chat-setting-temperature">Temperature</label>
@@ -1034,11 +1311,12 @@ function openChatSettings() {
         </div>`;
 
     document.body.appendChild(overlay);
-    overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    activateDialog(overlay, () => dismissDialog(overlay));
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => dismissDialog(overlay));
     overlay.querySelector('#chat-settings-form').addEventListener('submit', e => {
         e.preventDefault();
         chatRequestSettings = {
-            maxTokens: document.getElementById('chat-setting-max-tokens').value || '512',
+            maxTokens: document.getElementById('chat-setting-max-tokens').value || '4096',
             temperature: document.getElementById('chat-setting-temperature').value || '0.7',
             topP: document.getElementById('chat-setting-top-p').value || '0.95',
             presencePenalty: document.getElementById('chat-setting-presence').value || '0',
@@ -1048,11 +1326,11 @@ function openChatSettings() {
             stopSequences: document.getElementById('chat-setting-stop').value,
             includeHistory: document.getElementById('chat-setting-history').checked,
         };
-        overlay.remove();
+        dismissDialog(overlay);
         showToast('Chat settings saved', 'success');
     });
     overlay.addEventListener('click', e => {
-        if (e.target === overlay) overlay.remove();
+        if (e.target === overlay) dismissDialog(overlay);
     });
 }
 
@@ -1096,10 +1374,11 @@ function linesFromText(value) {
 function extractChatReply(data) {
     const choice = data?.choices?.[0] || {};
     const message = choice.message || {};
+    // llama-server returns reasoning separately when --reasoning-format extracts it;
+    // otherwise it stays inline in the content and is split out below.
+    const separateReasoning = [message.reasoning_content, message.reasoning].map(contentToText).filter(Boolean);
     const candidates = [
         message.content,
-        message.reasoning_content,
-        message.reasoning,
         choice.content,
         choice.text,
         choice.delta?.content,
@@ -1109,9 +1388,19 @@ function extractChatReply(data) {
         data?.text,
     ];
 
+    let content = '';
+    let inlineReasoning = '';
     for (const candidate of candidates) {
         const text = contentToText(candidate);
-        if (text) return { content: text, error: false };
+        if (text) {
+            ({ content, reasoning: inlineReasoning } = splitReasoning(text));
+            break;
+        }
+    }
+
+    const reasoning = [...separateReasoning, inlineReasoning].filter(Boolean).join('\n\n');
+    if (content || reasoning) {
+        return { content, reasoning, truncated: choice.finish_reason === 'length', error: false };
     }
 
     const preview = responsePreview(data);
@@ -1120,6 +1409,215 @@ function extractChatReply(data) {
             ? `No assistant text found in the response.\n\n${preview}`
             : 'No assistant text found in the response.',
         error: true,
+    };
+}
+
+// ── Markdown ─────────────────────────────────────────────────────────────
+// A small renderer for model answers. All text is escaped before any tags are
+// added, and links are limited to http(s), so model output cannot inject HTML.
+
+const MD_FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)/;
+const MD_HEADING = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+const MD_RULE = /^ {0,3}([-*_])( *\1){2,} *$/;
+const MD_QUOTE = /^ {0,3}> ?/;
+const MD_LIST_ITEM = /^( *)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+const MD_TABLE_DIVIDER = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+
+function renderMarkdown(text) {
+    return renderMarkdownBlocks(String(text ?? '').replace(/\r\n?/g, '\n').split('\n'));
+}
+
+function isMarkdownTableStart(lines, i) {
+    const divider = lines[i + 1];
+    return lines[i].includes('|') && divider !== undefined && divider.includes('|') && divider.includes('-') && MD_TABLE_DIVIDER.test(divider);
+}
+
+function startsMarkdownBlock(lines, i) {
+    const line = lines[i];
+    return MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line) || MD_QUOTE.test(line)
+        || MD_LIST_ITEM.test(line) || isMarkdownTableStart(lines, i);
+}
+
+function markdownIndent(line) {
+    return line.match(/^ */)[0].length;
+}
+
+function renderMarkdownBlocks(lines) {
+    const html = [];
+    let i = 0;
+    while (i < lines.length) {
+        const line = lines[i];
+        if (!line.trim()) {
+            i++;
+            continue;
+        }
+
+        const fence = line.match(MD_FENCE);
+        if (fence) {
+            const closing = new RegExp(`^ {0,3}${fence[1][0]}{${fence[1].length},}\\s*$`);
+            const code = [];
+            i++;
+            while (i < lines.length && !closing.test(lines[i])) code.push(lines[i++]);
+            i++; // closing fence; an unclosed fence (mid-stream) runs to the end
+            const lang = fence[2] ? `<span class="md-lang">${escapeHtml(fence[2])}</span>` : '';
+            html.push(`<div class="md-code-block"><div class="md-code-bar">${lang}<button class="md-copy" type="button">Copy</button></div><pre><code>${escapeHtml(code.join('\n'))}</code></pre></div>`);
+            continue;
+        }
+
+        const heading = line.match(MD_HEADING);
+        if (heading) {
+            const level = heading[1].length;
+            html.push(`<h${level} class="md-heading">${renderInlineMarkdown(heading[2])}</h${level}>`);
+            i++;
+            continue;
+        }
+
+        if (MD_RULE.test(line)) {
+            html.push('<hr>');
+            i++;
+            continue;
+        }
+
+        if (MD_QUOTE.test(line)) {
+            const quoted = [];
+            while (i < lines.length && MD_QUOTE.test(lines[i])) quoted.push(lines[i++].replace(MD_QUOTE, ''));
+            html.push(`<blockquote>${renderMarkdownBlocks(quoted)}</blockquote>`);
+            continue;
+        }
+
+        if (isMarkdownTableStart(lines, i)) {
+            const aligns = splitMarkdownRow(lines[i + 1]).map(cell => {
+                if (cell.startsWith(':') && cell.endsWith(':')) return 'center';
+                if (cell.endsWith(':')) return 'right';
+                return cell.startsWith(':') ? 'left' : '';
+            });
+            const cellHtml = (tag, cells) => cells.map((cell, col) => {
+                const align = aligns[col] ? ` style="text-align:${aligns[col]}"` : '';
+                return `<${tag}${align}>${renderInlineMarkdown(cell)}</${tag}>`;
+            }).join('');
+            const header = splitMarkdownRow(lines[i]);
+            i += 2;
+            const rows = [];
+            while (i < lines.length && lines[i].trim() && lines[i].includes('|')) rows.push(splitMarkdownRow(lines[i++]));
+            html.push(`<div class="md-table-wrap"><table><thead><tr>${cellHtml('th', header)}</tr></thead><tbody>${rows.map(row => `<tr>${cellHtml('td', row)}</tr>`).join('')}</tbody></table></div>`);
+            continue;
+        }
+
+        const item = line.match(MD_LIST_ITEM);
+        if (item) {
+            const [list, next] = collectMarkdownList(lines, i, item);
+            html.push(list);
+            i = next;
+            continue;
+        }
+
+        // Paragraph. Chat models use single newlines as line breaks, so keep them.
+        const paragraph = [lines[i++].trim()];
+        while (i < lines.length && lines[i].trim() && !startsMarkdownBlock(lines, i)) paragraph.push(lines[i++].trim());
+        html.push(`<p>${paragraph.map(renderInlineMarkdown).join('<br>')}</p>`);
+    }
+    return html.join('');
+}
+
+function collectMarkdownList(lines, start, firstItem) {
+    const ordered = /\d/.test(firstItem[2]);
+    const baseIndent = firstItem[1].length;
+    const isSibling = match => match && match[1].length <= baseIndent + 1 && /\d/.test(match[2]) === ordered;
+    const items = [];
+    let loose = false;
+    let i = start;
+    while (i < lines.length) {
+        const line = lines[i];
+        const match = line.match(MD_LIST_ITEM);
+        if (isSibling(match)) {
+            items.push({ number: parseInt(match[2], 10), lines: [match[3]] });
+            i++;
+            continue;
+        }
+        if (!line.trim()) {
+            // A blank line continues the list only if more list content follows.
+            let j = i + 1;
+            while (j < lines.length && !lines[j].trim()) j++;
+            const next = lines[j];
+            if (next === undefined || !(isSibling(next.match(MD_LIST_ITEM)) || markdownIndent(next) > baseIndent)) break;
+            loose = true;
+            items[items.length - 1].lines.push('');
+            i++;
+            continue;
+        }
+        if (markdownIndent(line) <= baseIndent) break;
+        // Nested content: strip the item's indentation so sub-lists start at column 0.
+        items[items.length - 1].lines.push(line.slice(Math.min(markdownIndent(line), baseIndent + 4)));
+        i++;
+    }
+
+    const body = items.map(entry => {
+        const inner = renderMarkdownBlocks(entry.lines);
+        return `<li>${loose ? inner : inner.replace(/^<p>([\s\S]*?)<\/p>/, '$1')}</li>`;
+    }).join('');
+    const startAttr = ordered && items[0].number !== 1 ? ` start="${items[0].number}"` : '';
+    return [ordered ? `<ol${startAttr}>${body}</ol>` : `<ul>${body}</ul>`, i];
+}
+
+function splitMarkdownRow(line) {
+    let text = line.trim();
+    if (text.startsWith('|')) text = text.slice(1);
+    if (text.endsWith('|') && !text.endsWith('\\|')) text = text.slice(0, -1);
+    return text.split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function renderInlineMarkdown(text) {
+    // Pull code spans out first so their contents are never formatted.
+    const slots = [];
+    const hold = html => `\u0000${slots.push(html) - 1}\u0000`;
+    let out = String(text).replace(/(`+)(.+?)\1(?!`)/g, (_, __, code) => hold(`<code>${escapeHtml(code.trim())}</code>`));
+    out = escapeHtml(out)
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+        .replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|\W)__(\S(?:.*?\S)?)__(?!\w)/g, '$1<strong>$2</strong>')
+        .replace(/(^|[^*\w])\*([^\s*](?:[^*]*?[^\s*])?)\*(?!\*)/g, '$1<em>$2</em>')
+        .replace(/(^|\W)_([^\s_](?:[^_]*?[^\s_])?)_(?!\w)/g, '$1<em>$2</em>')
+        .replace(/~~(\S(?:.*?\S)?)~~/g, '<del>$1</del>');
+    return out.replace(/\u0000(\d+)\u0000/g, (_, index) => slots[Number(index)]);
+}
+
+const REASONING_TAGS = ['think', 'thinking', 'reasoning'];
+
+// Separate chain-of-thought from the final answer in raw model output.
+function splitReasoning(text) {
+    let answer = String(text || '');
+    const reasoning = [];
+
+    // gpt-oss "harmony" format: analysis channel is reasoning, final channel is the answer.
+    if (answer.includes('<|channel|>')) {
+        for (const match of answer.matchAll(/<\|channel\|>analysis<\|message\|>([\s\S]*?)(?=<\|end\|>|<\|start\|>|<\|channel\|>|$)/g)) {
+            reasoning.push(match[1]);
+        }
+        const final = answer.match(/<\|channel\|>final<\|message\|>([\s\S]*?)(?:<\|(?:end|return)\|>|$)/);
+        answer = final ? final[1] : '';
+    }
+
+    for (const tag of REASONING_TAGS) {
+        const open = `<${tag}>`;
+        const close = `</${tag}>`;
+        // Many chat templates put the opening tag in the prompt, so the output
+        // starts mid-thought and only contains the closing tag.
+        const lower = answer.toLowerCase();
+        const firstClose = lower.indexOf(close);
+        if (firstClose !== -1 && !lower.slice(0, firstClose).includes(open)) {
+            reasoning.push(answer.slice(0, firstClose));
+            answer = answer.slice(firstClose + close.length);
+        }
+        // An unclosed tag means generation stopped while still reasoning.
+        answer = answer.replace(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|$)`, 'gi'), (_, inner) => {
+            reasoning.push(inner);
+            return '';
+        });
+    }
+
+    return {
+        content: answer.trim(),
+        reasoning: reasoning.map(part => part.trim()).filter(Boolean).join('\n\n'),
     };
 }
 
@@ -1162,6 +1660,437 @@ function chatMessages() {
 function scrollChatToBottom() {
     const win = document.getElementById('chat-window');
     if (win) win.scrollTop = win.scrollHeight;
+}
+
+function benchmarkServer() {
+    return servers.find(s => s.config.id === benchmarkConfigId) || servers[0] || null;
+}
+
+function benchmarkDefaults(profile = 'standard') {
+    const config = benchmarkServer()?.config || {};
+    const threads = Math.max(1, config.threads || settings?.default_threads || 4);
+    const gpuLayers = config.n_gpu_layers ?? settings?.default_n_gpu_layers ?? -1;
+    const base = {
+        config_id: config.id || '',
+        binary_path: '',
+        threads: [threads],
+        gpu_layers: [gpuLayers],
+        batch_sizes: [2048],
+        ubatch_sizes: [512],
+        flash_attention: ['auto'],
+        repetitions: 5,
+        no_warmup: false,
+        extra_args: '',
+    };
+    if (profile === 'quick') {
+        return { ...base, prompt_tokens: [512], generation_tokens: [128], repetitions: 3 };
+    }
+    if (profile === 'comprehensive') {
+        return {
+            ...base,
+            prompt_tokens: [128, 512, 2048, 4096],
+            generation_tokens: [32, 64, 128, 256, 512],
+            threads: [...new Set([Math.max(1, Math.floor(threads / 2)), threads])],
+            gpu_layers: [...new Set([0, gpuLayers])],
+            batch_sizes: [512, 2048],
+        };
+    }
+    return { ...base, prompt_tokens: [128, 512, 2048], generation_tokens: [64, 128, 256] };
+}
+
+function renderBenchmarkPage() {
+    const available = benchmarkOverview.available;
+    const active = benchmarkOverview.active;
+    const history = benchmarkOverview.history || [];
+    const header = `
+        <div class="page-header">
+            <div>
+                <h1>Benchmark</h1>
+                <p class="subtitle">Run repeatable prompt-processing and generation matrices with llama-bench</p>
+            </div>
+            <div class="header-actions">
+                <span class="benchmark-availability ${available ? 'available' : 'missing'}">
+                    <span class="status-dot"></span>${available ? 'llama-bench detected' : 'Binary not on PATH'}
+                </span>
+                ${history.length ? '<button class="btn btn-ghost btn-sm" id="benchmark-clear-history">Clear History</button>' : ''}
+            </div>
+        </div>`;
+
+    if (servers.length === 0) {
+        return header + `
+            <div class="empty-state">
+                <div class="empty-state-icon">${benchmarkIcon(36)}</div>
+                <h3>No Configurations</h3>
+                <p>Create a model configuration first. Benchmark uses its GGUF path, thread count, GPU layers, and environment.</p>
+                <a href="#configs" class="btn btn-primary">Go to Configs</a>
+            </div>`;
+    }
+
+    if (active) benchmarkConfigId = active.config_id;
+    if (!servers.some(s => s.config.id === benchmarkConfigId)) benchmarkConfigId = servers[0].config.id;
+    const selectedServer = benchmarkServer();
+    const params = active?.params || benchmarkDraft || benchmarkDefaults();
+    const disabled = active ? 'disabled' : '';
+    const blocked = selectedServer?.running;
+    const configOptions = servers.map(s => `
+        <option value="${s.config.id}" ${s.config.id === benchmarkConfigId ? 'selected' : ''}>
+            ${escapeHtml(s.config.name)}${s.running ? ' (running)' : ''}
+        </option>`).join('');
+
+    const selectedRun = benchmarkSelectedRun(history);
+    return header + `
+        <div class="benchmark-layout">
+            <form class="benchmark-panel benchmark-form-panel" id="benchmark-form" data-active-run="${escapeHtml(active?.id || '')}">
+                <div class="benchmark-panel-header">
+                    <div>
+                        <h2>Test Matrix</h2>
+                        <p>Comma-separated values create a repeatable parameter sweep.</p>
+                    </div>
+                    <span class="benchmark-test-count" id="benchmark-test-count">${benchmarkScenarioCount(params)} tests</span>
+                </div>
+                <div class="benchmark-profiles" aria-label="Benchmark profiles">
+                    <button type="button" class="btn btn-ghost btn-sm benchmark-profile" data-profile="quick" ${disabled}>Quick</button>
+                    <button type="button" class="btn btn-ghost btn-sm benchmark-profile" data-profile="standard" ${disabled}>Standard</button>
+                    <button type="button" class="btn btn-ghost btn-sm benchmark-profile" data-profile="comprehensive" ${disabled}>Comprehensive</button>
+                </div>
+                <div class="form-grid benchmark-form-grid">
+                    <div class="form-group full-width">
+                        <label for="benchmark-config">Model Config</label>
+                        <select id="benchmark-config" ${disabled}>${configOptions}</select>
+                        <span class="form-hint">${escapeHtml(selectedServer?.config.model_path || '')}</span>
+                    </div>
+                    <div class="form-group full-width">
+                        <label for="benchmark-binary">llama-bench Binary (optional)</label>
+                        <input type="text" id="benchmark-binary" value="${escapeHtml(params.binary_path || '')}" placeholder="${escapeHtml(benchmarkOverview.binary_path || '/path/to/llama-bench')}" ${disabled}>
+                        <span class="form-hint">Leave blank to use PATH or LLMHUB_LLAMA_BENCH.</span>
+                    </div>
+                    ${benchmarkListInput('benchmark-prompts', 'Prompt Tokens', params.prompt_tokens, 'Prompt-processing sizes; blank disables pp tests', disabled)}
+                    ${benchmarkListInput('benchmark-generation', 'Generation Tokens', params.generation_tokens, 'Generation sizes; blank disables tg tests', disabled)}
+                    ${benchmarkListInput('benchmark-threads', 'Threads', params.threads, 'CPU thread sweep', disabled)}
+                    ${benchmarkListInput('benchmark-gpu-layers', 'GPU Layers', params.gpu_layers, '-1 means all; 0 means CPU', disabled)}
+                    ${benchmarkListInput('benchmark-batches', 'Batch Sizes', params.batch_sizes, 'Logical batch size (-b)', disabled)}
+                    ${benchmarkListInput('benchmark-ubatches', 'Micro-batch Sizes', params.ubatch_sizes, 'Physical batch size (-ub)', disabled)}
+                    <div class="form-group">
+                        <label for="benchmark-flash">Flash Attention</label>
+                        <input type="text" id="benchmark-flash" value="${escapeHtml(params.flash_attention.join(','))}" placeholder="auto,on,off" ${disabled}>
+                        <span class="form-hint">auto, on, or off</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="benchmark-repetitions">Repetitions</label>
+                        <input type="number" id="benchmark-repetitions" min="1" max="20" value="${params.repetitions}" ${disabled}>
+                        <span class="form-hint">Each test is averaged across these trials</span>
+                    </div>
+                    <div class="form-group full-width">
+                        <label for="benchmark-extra-args">Extra llama-bench Arguments</label>
+                        <input type="text" id="benchmark-extra-args" value="${escapeHtml(params.extra_args || '')}" placeholder="--numa isolate -ctk q8_0 -ctv q8_0" ${disabled}>
+                        <span class="form-hint">Model and output-format flags are managed automatically.</span>
+                    </div>
+                    <div class="form-group full-width">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="benchmark-no-warmup" ${params.no_warmup ? 'checked' : ''} ${disabled}>
+                            <span class="checkmark"></span> Skip warmup runs
+                        </label>
+                    </div>
+                    <div class="form-group full-width">
+                        <label>Command Preview</label>
+                        <pre class="command-preview" id="benchmark-command-preview">${escapeHtml(benchmarkCommandPreview(params))}</pre>
+                    </div>
+                </div>
+                ${blocked ? '<div class="benchmark-warning">Stop this config\'s server before running its benchmark.</div>' : ''}
+                <div class="benchmark-actions">
+                    <span>For comparable results, stop other GPU-heavy workloads first.</span>
+                    <button type="submit" class="btn btn-primary" ${active || blocked ? 'disabled' : ''}>${benchmarkIcon(16)} Run Benchmark</button>
+                </div>
+            </form>
+            <div id="benchmark-live">${active ? renderActiveBenchmark(active) : renderBenchmarkHistory(history)}</div>
+        </div>
+        ${active ? '' : renderBenchmarkResults(selectedRun)}`;
+}
+
+function benchmarkListInput(id, label, values, hint, disabled) {
+    return `
+        <div class="form-group">
+            <label for="${id}">${label}</label>
+            <input type="text" id="${id}" value="${escapeHtml((values || []).join(','))}" ${disabled}>
+            <span class="form-hint">${hint}</span>
+        </div>`;
+}
+
+function renderActiveBenchmark(run) {
+    const elapsed = Math.max(0, Math.round((Date.now() - new Date(run.started_at).getTime()) / 1000));
+    return `
+        <section class="benchmark-panel benchmark-active-panel">
+            <div class="benchmark-panel-header">
+                <div><h2>Running</h2><p>${escapeHtml(run.config_name)}</p></div>
+                <span class="inline-status loading"><span class="status-dot"></span>${run.status === 'stopping' ? 'Stopping' : `${elapsed}s elapsed`}</span>
+            </div>
+            <div class="benchmark-active-metrics">
+                <div><span>Matrix</span><strong>${benchmarkScenarioCount(run.params)} tests</strong></div>
+                <div><span>Repetitions</span><strong>${run.params.repetitions}</strong></div>
+            </div>
+            <pre class="benchmark-command">${escapeHtml(run.command_text)}</pre>
+            <div class="benchmark-log">${run.log_lines?.length
+                ? run.log_lines.map(line => `<div>${escapeHtml(line)}</div>`).join('')
+                : '<span>llama-bench is loading the model…</span>'}</div>
+            <button class="btn btn-danger" id="benchmark-stop" data-id="${run.id}" data-focus-key="benchmark-stop-${escapeHtml(run.id)}" ${run.status === 'stopping' ? 'disabled' : ''}>Stop Benchmark</button>
+        </section>`;
+}
+
+function renderBenchmarkHistory(history) {
+    if (!history.length) {
+        return `
+            <section class="benchmark-panel benchmark-history-panel">
+                <div class="benchmark-panel-header"><div><h2>Recent Runs</h2><p>Completed runs are saved locally.</p></div></div>
+                <div class="benchmark-history-empty">No benchmark results yet.</div>
+            </section>`;
+    }
+    return `
+        <section class="benchmark-panel benchmark-history-panel">
+            <div class="benchmark-panel-header"><div><h2>Recent Runs</h2><p>Latest ${history.length} of 20 retained runs.</p></div></div>
+            <div class="benchmark-history-list">
+                ${history.map(run => `
+                    <button type="button" class="benchmark-history-item ${benchmarkSelectedRun(history)?.id === run.id ? 'selected' : ''}" data-id="${run.id}">
+                        <span><strong>${escapeHtml(run.config_name)}</strong><small>${escapeHtml(new Date(run.started_at).toLocaleString())}</small></span>
+                        <span><strong class="benchmark-run-status ${run.status}">${escapeHtml(run.status)}</strong><small>${run.results.length} tests · ${run.duration_seconds ?? 0}s</small></span>
+                    </button>`).join('')}
+            </div>
+        </section>`;
+}
+
+function renderBenchmarkResults(run) {
+    if (!run) return '';
+    if (run.status !== 'completed') {
+        return `
+            <section class="benchmark-results-panel">
+                <div class="benchmark-panel-header"><div><h2>Run Details</h2><p>${escapeHtml(run.config_name)}</p></div></div>
+                <div class="benchmark-warning error">${escapeHtml(run.error || `Benchmark ${run.status}`)}</div>
+                ${run.log_lines?.length ? `<pre class="benchmark-failure-log">${escapeHtml(run.log_lines.join('\n'))}</pre>` : ''}
+            </section>`;
+    }
+    const promptResults = run.results.filter(item => Number(item.n_prompt) > 0);
+    const generationResults = run.results.filter(item => Number(item.n_gen) > 0);
+    const bestPrompt = bestBenchmarkResult(promptResults);
+    const bestGeneration = bestBenchmarkResult(generationResults);
+    const first = run.results[0] || {};
+    return `
+        <section class="benchmark-results-panel">
+            <div class="benchmark-panel-header">
+                <div><h2>Results · ${escapeHtml(run.config_name)}</h2><p>${escapeHtml(first.model_type || run.model_path)}</p></div>
+                <button class="btn btn-ghost btn-sm" id="benchmark-export-run" data-id="${run.id}">${downloadIcon(14)} Export JSON</button>
+            </div>
+            <div class="benchmark-summary-grid">
+                ${benchmarkSummaryCard('Best Prompt', bestPrompt ? `${formatBenchmarkRate(bestPrompt.avg_ts)} t/s` : 'n/a', bestPrompt ? benchmarkTestLabel(bestPrompt) : '')}
+                ${benchmarkSummaryCard('Best Generation', bestGeneration ? `${formatBenchmarkRate(bestGeneration.avg_ts)} t/s` : 'n/a', bestGeneration ? benchmarkTestLabel(bestGeneration) : '')}
+                ${benchmarkSummaryCard('Backend', first.backends || 'Unknown', first.gpu_info || first.cpu_info || '')}
+                ${benchmarkSummaryCard('Run', `${run.results.length} tests`, `${run.duration_seconds ?? 0}s · ${run.params.repetitions} reps`)}
+            </div>
+            <div class="benchmark-table-wrap">
+                <table class="benchmark-table">
+                    <thead><tr><th>Test</th><th>Threads</th><th>GPU Layers</th><th>Batch</th><th>Micro-batch</th><th>Flash</th><th>Throughput</th><th>Stddev</th></tr></thead>
+                    <tbody>${run.results.map(item => `
+                        <tr>
+                            <td><strong>${escapeHtml(benchmarkTestLabel(item))}</strong></td>
+                            <td>${item.n_threads ?? '—'}</td>
+                            <td>${item.n_gpu_layers === -1 ? 'all' : item.n_gpu_layers ?? '—'}</td>
+                            <td>${item.n_batch ?? '—'}</td>
+                            <td>${item.n_ubatch ?? '—'}</td>
+                            <td>${escapeHtml(benchmarkFlashLabel(item.flash_attn))}</td>
+                            <td class="benchmark-rate">${formatBenchmarkRate(item.avg_ts)} t/s</td>
+                            <td>± ${formatBenchmarkRate(item.stddev_ts)}</td>
+                        </tr>`).join('')}</tbody>
+                </table>
+            </div>
+        </section>`;
+}
+
+function benchmarkSummaryCard(label, value, detail) {
+    return `<div class="benchmark-summary-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></div>`;
+}
+
+function bindBenchmarkEvents() {
+    document.getElementById('benchmark-config')?.addEventListener('change', e => {
+        rememberConfig(e.target.value);
+        benchmarkDraft = null;
+        refreshBenchmarkSurface({preserve: false});
+    });
+    document.querySelectorAll('.benchmark-profile').forEach(button => {
+        button.addEventListener('click', () => {
+            benchmarkDraft = benchmarkDefaults(button.dataset.profile);
+            refreshBenchmarkSurface({preserve: false});
+        });
+    });
+    document.getElementById('benchmark-form')?.addEventListener('submit', startLlamaBenchmark);
+    document.querySelectorAll('#benchmark-form input').forEach(input => {
+        input.addEventListener('input', updateBenchmarkPreview);
+        input.addEventListener('change', updateBenchmarkPreview);
+    });
+    document.getElementById('benchmark-stop')?.addEventListener('click', stopLlamaBenchmark);
+    document.querySelectorAll('.benchmark-history-item').forEach(button => {
+        button.addEventListener('click', () => {
+            benchmarkSelectedRunId = button.dataset.id;
+            refreshBenchmarkSurface();
+        });
+    });
+    document.getElementById('benchmark-export-run')?.addEventListener('click', () => {
+        const run = (benchmarkOverview.history || []).find(item => item.id === benchmarkSelectedRunId) || benchmarkOverview.history?.[0];
+        if (run) downloadJson(run, `llmhub-benchmark-${run.id}.json`);
+    });
+    document.getElementById('benchmark-clear-history')?.addEventListener('click', () => {
+        showConfirm('Clear benchmark history?', 'All completed benchmark results will be removed.', async () => {
+            try {
+                await apiDelete('/benchmarks');
+                benchmarkOverview.history = [];
+                benchmarkSelectedRunId = '';
+                refreshBenchmarkSurface();
+                showToast('Benchmark history cleared', 'info');
+            } catch (e) {
+                showToast('Could not clear history: ' + e.message, 'error');
+            }
+        });
+    });
+}
+
+async function startLlamaBenchmark(event) {
+    event.preventDefault();
+    try {
+        const payload = benchmarkPayloadFromForm();
+        benchmarkDraft = payload;
+        const run = await apiPost('/benchmarks', payload);
+        benchmarkOverview.active = run;
+        showToast('Benchmark started', 'success');
+        refreshBenchmarkSurface();
+        startBenchmarkPoller();
+    } catch (e) {
+        showToast('Benchmark could not start: ' + e.message, 'error');
+    }
+}
+
+async function stopLlamaBenchmark(event) {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+        await apiPost(`/benchmarks/${button.dataset.id}/stop`);
+        await fetchBenchmarks({ quiet: true });
+        refreshBenchmarkSurface();
+        showToast('Benchmark stop requested', 'info');
+    } catch (e) {
+        button.disabled = false;
+        showToast('Could not stop benchmark: ' + e.message, 'error');
+    }
+}
+
+function benchmarkPayloadFromForm() {
+    const flash = document.getElementById('benchmark-flash').value.split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+    if (!flash.length || flash.some(value => !['auto', 'on', 'off'].includes(value))) {
+        throw new Error('Flash attention values must be auto, on, or off');
+    }
+    return {
+        config_id: benchmarkConfigId,
+        binary_path: document.getElementById('benchmark-binary').value.trim(),
+        prompt_tokens: parseBenchmarkIntegerList('benchmark-prompts', { allowEmpty: true, min: 1 }),
+        generation_tokens: parseBenchmarkIntegerList('benchmark-generation', { allowEmpty: true, min: 1 }),
+        threads: parseBenchmarkIntegerList('benchmark-threads', { min: 1 }),
+        gpu_layers: parseBenchmarkIntegerList('benchmark-gpu-layers', { min: -1 }),
+        batch_sizes: parseBenchmarkIntegerList('benchmark-batches', { min: 1 }),
+        ubatch_sizes: parseBenchmarkIntegerList('benchmark-ubatches', { min: 1 }),
+        flash_attention: [...new Set(flash)],
+        repetitions: parseInt(document.getElementById('benchmark-repetitions').value, 10),
+        no_warmup: document.getElementById('benchmark-no-warmup').checked,
+        extra_args: document.getElementById('benchmark-extra-args').value.trim(),
+    };
+}
+
+function parseBenchmarkIntegerList(id, { allowEmpty = false, min = 1 } = {}) {
+    const raw = document.getElementById(id).value.trim();
+    if (!raw && allowEmpty) return [];
+    const values = raw.split(',').map(value => Number(value.trim()));
+    if (!values.length || values.some(value => !Number.isInteger(value) || value < min)) {
+        throw new Error(`${document.querySelector(`label[for="${id}"]`)?.textContent || id} must be comma-separated integers of ${min} or greater`);
+    }
+    return [...new Set(values)];
+}
+
+function updateBenchmarkPreview() {
+    capturePageState();
+    try {
+        const params = benchmarkPayloadFromForm();
+        document.getElementById('benchmark-test-count').textContent = `${benchmarkScenarioCount(params)} tests`;
+        document.getElementById('benchmark-command-preview').textContent = benchmarkCommandPreview(params);
+    } catch {
+        document.getElementById('benchmark-test-count').textContent = 'Check values';
+    }
+}
+
+function benchmarkCommandPreview(params) {
+    const config = benchmarkServer()?.config || {};
+    const binary = params.binary_path || benchmarkOverview.binary_path || 'llama-bench';
+    return [
+        shellQuote(binary), '-m', shellQuote(config.model_path || '/path/to/model.gguf'),
+        '-p', (params.prompt_tokens || []).join(',') || '0',
+        '-n', (params.generation_tokens || []).join(',') || '0',
+        '-t', (params.threads || []).join(','),
+        '-ngl', (params.gpu_layers || []).join(','),
+        '-b', (params.batch_sizes || []).join(','),
+        '-ub', (params.ubatch_sizes || []).join(','),
+        '-fa', (params.flash_attention || []).join(','),
+        '-r', params.repetitions,
+        params.no_warmup ? '--no-warmup' : '',
+        params.extra_args || '', '--progress -o json',
+    ].filter(value => value !== '').join(' ');
+}
+
+function benchmarkScenarioCount(params) {
+    const base = (params.prompt_tokens?.length || 0) + (params.generation_tokens?.length || 0);
+    return base
+        * (params.threads?.length || 0)
+        * (params.gpu_layers?.length || 0)
+        * (params.batch_sizes?.length || 0)
+        * (params.ubatch_sizes?.length || 0)
+        * (params.flash_attention?.length || 0);
+}
+
+function benchmarkSelectedRun(history) {
+    const selected = history.find(run => run.id === benchmarkSelectedRunId) || history[0] || null;
+    if (selected) benchmarkSelectedRunId = selected.id;
+    return selected;
+}
+
+function refreshBenchmarkSurface({preserve = true} = {}) {
+    if (currentPage !== 'benchmark') return;
+    const active = benchmarkOverview.active;
+    if (active && document.getElementById('benchmark-form')?.dataset.activeRun === active.id) {
+        replaceSurface('benchmark-live', renderActiveBenchmark(active));
+        document.getElementById('benchmark-stop').onclick = stopLlamaBenchmark;
+        return;
+    }
+    if (preserve) capturePageState();
+    else pageStates.delete('benchmark');
+    document.getElementById('main-content').innerHTML = renderBenchmarkPage();
+    if (preserve) restorePageState('benchmark');
+    bindBenchmarkEvents();
+}
+
+function bestBenchmarkResult(results) {
+    return results.reduce((best, item) => Number(item.avg_ts) > Number(best?.avg_ts ?? -1) ? item : best, null);
+}
+
+function benchmarkTestLabel(item) {
+    const prompt = Number(item.n_prompt) || 0;
+    const generation = Number(item.n_gen) || 0;
+    if (prompt && generation) return `pp${prompt} + tg${generation}`;
+    if (prompt) return `pp${prompt}`;
+    if (generation) return `tg${generation}`;
+    return 'custom';
+}
+
+function benchmarkFlashLabel(value) {
+    return ({ '-1': 'auto', 0: 'off', 1: 'on', auto: 'auto', off: 'off', on: 'on' })[value] ?? String(value ?? '—');
+}
+
+function formatBenchmarkRate(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    return number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function renderTokenCalculatorPage() {
@@ -1225,7 +2154,7 @@ function renderTokenCalculatorPage() {
 
 function bindTokenCalculatorEvents() {
     document.getElementById('token-calculator-server')?.addEventListener('change', e => {
-        tokenCalculatorConfigId = e.target.value;
+        rememberConfig(e.target.value);
         updateTokenCalculatorSummary();
     });
     document.getElementById('token-input-price')?.addEventListener('input', e => {
@@ -1359,38 +2288,43 @@ function bindSettingsEvents() {
 }
 
 function switchTerminalServer(serverId) {
-    currentTerminalServerId = serverId;
-    currentTerminalOffset = 0;
+    rememberConfig(serverId);
     terminalLines = [];
     renderTerminalLines();
     stopTerminalPoller();
     pollTerminalOutput();
-    terminalPoller = setInterval(pollTerminalOutput, 1000);
 }
 
 function stopTerminalPoller() {
+    terminalRequestId += 1;
     if (terminalPoller) {
-        clearInterval(terminalPoller);
+        clearTimeout(terminalPoller);
         terminalPoller = null;
     }
 }
 
 async function pollTerminalOutput() {
-    if (currentPage !== 'terminal' || !currentTerminalServerId || terminalPaused) return;
+    if (currentPage !== 'terminal' || !currentTerminalServerId) return;
+    const serverId = currentTerminalServerId;
+    const requestId = ++terminalRequestId;
 
     try {
-        const data = await apiGet(`/configs/${currentTerminalServerId}/output?offset=${currentTerminalOffset}`);
-        const server = servers.find(s => s.config.id === currentTerminalServerId);
-        updateTerminalStatus(data.running, server?.health);
-
-        if (data.lines && data.lines.length > 0) {
-            terminalLines.push(...data.lines);
-            currentTerminalOffset += data.lines.length;
-            renderTerminalLines();
-        }
+        if (terminalPaused) return;
+        // Refresh the bounded snapshot so partial lines, rollover, clears, and
+        // process restarts are reflected without duplicating or missing output.
+        const data = await apiGet(`/configs/${serverId}/output?offset=0`);
+        if (requestId !== terminalRequestId || currentPage !== 'terminal' || terminalPaused) return;
+        const server = servers.find(s => s.config.id === serverId);
+        updateTerminalStatus(data.running, data.running ? server?.health : 'stopped');
+        terminalLines = data.lines || [];
+        renderTerminalLines();
         renderLogAnnotations(data.annotations || []);
     } catch (e) {
         console.error('Terminal polling failed:', e);
+    } finally {
+        if (requestId === terminalRequestId && currentPage === 'terminal') {
+            terminalPoller = setTimeout(pollTerminalOutput, 1000);
+        }
     }
 }
 
@@ -1452,6 +2386,7 @@ function toggleTerminalPause() {
 function toggleTerminalAutoscroll() {
     terminalAutoScroll = !terminalAutoScroll;
     document.getElementById('terminal-autoscroll-btn').textContent = terminalAutoScroll ? 'Auto-scroll On' : 'Auto-scroll Off';
+    document.getElementById('terminal-autoscroll-btn').setAttribute('aria-pressed', String(terminalAutoScroll));
 }
 
 function copyTerminalOutput() {
@@ -1467,14 +2402,19 @@ function downloadTerminalLogs() {
 
 async function clearTerminalOutput() {
     if (!currentTerminalServerId) return;
+    const serverId = currentTerminalServerId;
+    stopTerminalPoller();
+    const requestId = terminalRequestId;
     try {
-        await apiPost(`/configs/${currentTerminalServerId}/output/clear`);
+        await apiPost(`/configs/${serverId}/output/clear`);
+        if (requestId !== terminalRequestId || currentPage !== 'terminal') return;
         terminalLines = [];
-        currentTerminalOffset = 0;
         renderTerminalLines();
         showToast('Terminal output cleared', 'info');
     } catch (e) {
         showToast('Failed to clear output: ' + e.message, 'error');
+    } finally {
+        if (requestId === terminalRequestId && currentPage === 'terminal') pollTerminalOutput();
     }
 }
 
@@ -1490,6 +2430,11 @@ function openModal(config = null) {
     document.getElementById('config-port').value = config?.port || defaults.default_base_port || 8080;
     document.getElementById('config-gpu-layers').value = config?.n_gpu_layers ?? defaults.default_n_gpu_layers ?? -1;
     document.getElementById('config-ctx-size').value = config?.ctx_size || defaults.default_ctx_size || 4096;
+    document.getElementById('config-output-unlimited').checked = (config?.n_predict ?? -1) === -1;
+    document.getElementById('config-output-tokens').value = config?.n_predict >= 0 ? config.n_predict : 512;
+    syncOutputLimit();
+    clearConfigErrors();
+    document.getElementById('config-advanced-section').open = false;
     document.getElementById('config-threads').value = config?.threads || defaults.default_threads || 4;
     document.getElementById('config-parallel').value = config?.parallel || defaults.default_parallel || 1;
     document.getElementById('config-cont-batching').checked = config?.cont_batching ?? true;
@@ -1499,7 +2444,9 @@ function openModal(config = null) {
     document.getElementById('config-env-vars').value = Object.entries(config?.env_vars || {}).map(([key, value]) => `${key}=${value}`).join('\n');
     setupModelPathPicker();
     updateCommandPreview();
-    document.getElementById('config-modal').classList.add('open');
+    const overlay = document.getElementById('config-modal');
+    overlay.classList.add('open');
+    activateDialog(overlay, closeModal);
 }
 
 function populatePresetSelect() {
@@ -1509,7 +2456,10 @@ function populatePresetSelect() {
 }
 
 function closeModal() {
-    document.getElementById('config-modal').classList.remove('open');
+    const overlay = document.getElementById('config-modal');
+    overlay.classList.remove('open');
+    deactivateDialog(overlay);
+    overlay.inert = true;
     hideModelPathMenu();
 }
 
@@ -1576,16 +2526,20 @@ function renderModelPathOptions() {
     if (!matches.length) {
         menu.innerHTML = '<div class="model-path-option"><div class="model-path-option-name">No matching GGUF models</div></div>';
         menu.classList.add('open');
+        input.setAttribute('aria-expanded', 'true');
+        input.removeAttribute('aria-activedescendant');
         return;
     }
 
     menu.innerHTML = matches.map((item, index) => `
-        <div class="model-path-option ${index === modelPathActiveIndex ? 'active' : ''}" role="option" data-path="${escapeHtml(item.path)}">
+        <div class="model-path-option ${index === modelPathActiveIndex ? 'active' : ''}" role="option" id="model-path-option-${index}" aria-selected="${index === modelPathActiveIndex}" data-path="${escapeHtml(item.path)}">
             <div class="model-path-option-name">${escapeHtml(item.name)}</div>
             <div class="model-path-option-meta">${escapeHtml(item.size_label ? `${item.size_label} - ${item.path}` : item.path)}</div>
         </div>
     `).join('');
     menu.classList.add('open');
+    input.setAttribute('aria-expanded', 'true');
+    setModelPathActive(modelPathActiveIndex);
 
     menu.querySelectorAll('.model-path-option[data-path]').forEach((optionEl, index) => {
         optionEl.addEventListener('mouseenter', () => setModelPathActive(index));
@@ -1600,6 +2554,7 @@ function handleModelPathKeydown(e) {
     const menu = document.getElementById('model-path-menu');
     const options = [...(menu?.querySelectorAll('.model-path-option[data-path]') || [])];
     if (e.key === 'Escape') {
+        if (menu?.classList.contains('open')) { e.stopPropagation(); e.preventDefault(); }
         hideModelPathMenu();
         return;
     }
@@ -1620,9 +2575,11 @@ function handleModelPathKeydown(e) {
 }
 
 function setModelPathActive(index) {
+    document.getElementById('config-model-path').setAttribute('aria-activedescendant', `model-path-option-${index}`);
     modelPathActiveIndex = index;
     document.querySelectorAll('#model-path-menu .model-path-option').forEach((el, optionIndex) => {
         el.classList.toggle('active', optionIndex === index);
+        el.setAttribute('aria-selected', String(optionIndex === index));
     });
 }
 
@@ -1638,6 +2595,8 @@ function hideModelPathMenu() {
     const menu = document.getElementById('model-path-menu');
     if (!menu) return;
     menu.classList.remove('open');
+    document.getElementById('config-model-path').setAttribute('aria-expanded', 'false');
+    document.getElementById('config-model-path').removeAttribute('aria-activedescendant');
     menu.innerHTML = '';
     modelPathActiveIndex = -1;
 }
@@ -1690,25 +2649,100 @@ document.getElementById('find-port-btn').addEventListener('click', async () => {
     }
 });
 
-document.getElementById('config-form').addEventListener('submit', async e => {
-    e.preventDefault();
+document.getElementById('config-output-unlimited').addEventListener('change', () => { syncOutputLimit(); updateCommandPreview(); });
+document.getElementById('config-form').addEventListener('input', event => {
+    clearConfigFieldError(event.target);
+    document.getElementById('config-form-error').hidden = true;
+});
+document.getElementById('config-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!validateConfigForm()) return;
     const id = document.getElementById('config-id').value;
-    const data = formConfigData();
-
+    const button = document.getElementById('modal-save');
+    button.disabled = true;
+    button.textContent = 'Saving…';
     try {
-        if (id) {
-            await apiPut(`/configs/${id}`, data);
-            showToast('Configuration updated', 'success');
-        } else {
-            await apiPost('/configs', data);
-            showToast('Configuration created', 'success');
-        }
+        const data = formConfigData();
+        if (id) await apiPut(`/configs/${id}`, data);
+        else await apiPost('/configs', data);
         closeModal();
-        render();
-    } catch (err) {
-        showToast('Failed to save: ' + err.message, 'error');
+        showToast(id ? 'Configuration updated' : 'Configuration created', 'success');
+        await render();
+    } catch (error) {
+        const fields = {name: 'name', model_path: 'model-path', host: 'host', port: 'port', n_gpu_layers: 'gpu-layers', ctx_size: 'ctx-size', n_predict: 'output-tokens', threads: 'threads', parallel: 'parallel', mmproj_path: 'mmproj-path', extra_args: 'extra-args', advanced_args: 'advanced-args', env_vars: 'env-vars'};
+        (error.fields || []).forEach(field => {
+            const name = field.loc.find(part => Object.hasOwn(fields, part));
+            if (name) setConfigFieldError(document.getElementById(`config-${fields[name]}`), field.msg.replace(/^Value error, /, ''));
+        });
+        const summary = document.getElementById('config-form-error');
+        summary.textContent = error.fields?.length ? 'Check the highlighted fields and try again.' : error.message;
+        summary.hidden = false;
+        focusConfigError();
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Save configuration';
     }
 });
+
+function syncOutputLimit() {
+    const input = document.getElementById('config-output-tokens');
+    input.disabled = document.getElementById('config-output-unlimited').checked;
+    clearConfigFieldError(input);
+}
+
+function clearConfigFieldError(input) {
+    input?.removeAttribute('aria-invalid');
+    const errorId = `${input?.id}-error`;
+    document.getElementById(errorId)?.remove();
+    if (input) {
+        const descriptions = (input.getAttribute('aria-describedby') || '').split(' ').filter(id => id && id !== errorId);
+        if (descriptions.length) input.setAttribute('aria-describedby', descriptions.join(' '));
+        else input.removeAttribute('aria-describedby');
+    }
+}
+
+function clearConfigErrors() {
+    document.querySelectorAll('#config-form [aria-invalid]').forEach(clearConfigFieldError);
+    document.getElementById('config-form-error').hidden = true;
+}
+
+function setConfigFieldError(input, message) {
+    if (!input) return;
+    clearConfigFieldError(input);
+    input.setAttribute('aria-invalid', 'true');
+    const error = document.createElement('span');
+    error.id = `${input.id}-error`;
+    error.className = 'field-error';
+    error.textContent = message;
+    input.closest('.form-group').appendChild(error);
+    input.setAttribute('aria-describedby', `${input.getAttribute('aria-describedby') || ''} ${error.id}`.trim());
+}
+
+function focusConfigError() {
+    const first = document.querySelector('#config-form [aria-invalid="true"]');
+    if (first) {
+        const advanced = first.closest('details');
+        if (advanced) advanced.open = true;
+        first.focus();
+    }
+}
+
+function validateConfigForm() {
+    clearConfigErrors();
+    document.querySelectorAll('#config-form input:not([type="hidden"]), #config-form textarea').forEach(input => {
+        if (input.disabled || input.type === 'checkbox') return;
+        let message = '';
+        if (input.required && !input.value.trim()) message = 'This field is required.';
+        else if (!input.validity.valid) message = input.validationMessage;
+        else if (input.id === 'config-model-path' && !/\.gguf$/i.test(input.value.trim())) message = 'Choose a .gguf model file.';
+        else if (input.id === 'config-mmproj-path' && input.value.trim() && !/\.(gguf|mmproj)$/i.test(input.value.trim())) message = 'Choose a .gguf or .mmproj projector.';
+        else if (input.id === 'config-env-vars' && linesFromText(input.value).some(line => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(line))) message = 'Use one KEY=value entry per line.';
+        if (message) setConfigFieldError(input, message);
+    });
+    const valid = !document.querySelector('#config-form [aria-invalid="true"]');
+    if (!valid) focusConfigError();
+    return valid;
+}
 
 function formConfigData() {
     return {
@@ -1718,6 +2752,7 @@ function formConfigData() {
         port: parseInt(document.getElementById('config-port').value, 10),
         n_gpu_layers: parseInt(document.getElementById('config-gpu-layers').value, 10),
         ctx_size: parseInt(document.getElementById('config-ctx-size').value, 10),
+        n_predict: document.getElementById('config-output-unlimited').checked ? -1 : Number(document.getElementById('config-output-tokens').value),
         threads: parseInt(document.getElementById('config-threads').value, 10),
         parallel: parseInt(document.getElementById('config-parallel').value, 10),
         cont_batching: document.getElementById('config-cont-batching').checked,
@@ -1746,6 +2781,7 @@ function updateCommandPreview() {
         data.mmproj_path ? `--mmproj ${shellQuote(data.mmproj_path)}` : '',
         ...(data.advanced_args || []),
         data.extra_args || '',
+        data.n_predict >= 0 ? `--n-predict ${data.n_predict}` : '',
     ].filter(Boolean).join(' ');
     preview.textContent = cmd;
 }
@@ -1763,6 +2799,95 @@ function envVarsFromTextarea(id) {
     return env;
 }
 
+function dialogFocusables(overlay) {
+    return [...overlay.querySelectorAll('button, a[href], input, select, textarea, summary, [tabindex]')].filter(el => {
+        const collapsed = el.closest('details:not([open])');
+        return !el.disabled && el.tabIndex >= 0 && el.getClientRects().length && !el.closest('[inert]')
+            && (!collapsed || collapsed.querySelector('summary') === el);
+    });
+}
+
+function activateDialog(overlay, close) {
+    if (dialogStack.some(item => item.overlay === overlay)) return;
+    const panel = overlay.querySelector('.modal, .confirm-dialog');
+    const trigger = document.activeElement;
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.tabIndex = -1;
+    const title = panel.querySelector('h2, h3');
+    if (title) {
+        title.id ||= `dialog-title-${Date.now()}-${dialogStack.length}`;
+        panel.setAttribute('aria-labelledby', title.id);
+    }
+    const previous = dialogStack.at(-1);
+    if (previous) previous.overlay.inert = true;
+    overlay.inert = false;
+    dialogStack.push({overlay, close, trigger});
+    panel.focus({preventScroll: true});
+    document.querySelectorAll('.workspace-shell, .sidebar, .skip-link').forEach(el => { el.inert = true; });
+    document.body.classList.add('dialog-open');
+    requestAnimationFrame(() => {
+        if (dialogStack.at(-1)?.overlay === overlay && (document.activeElement === panel || !overlay.contains(document.activeElement))) {
+            (dialogFocusables(overlay).find(el => el.tagName === 'INPUT') || dialogFocusables(overlay)[0] || panel).focus();
+        }
+    });
+}
+
+function deactivateDialog(overlay) {
+    const index = dialogStack.findIndex(item => item.overlay === overlay);
+    if (index < 0) return;
+    const [dialog] = dialogStack.splice(index, 1);
+    const previous = dialogStack.at(-1);
+    if (previous) previous.overlay.inert = false;
+    else {
+        document.querySelectorAll('.workspace-shell, .sidebar, .skip-link').forEach(el => { el.inert = false; });
+        document.body.classList.remove('dialog-open');
+    }
+    const restoredTrigger = dialog.trigger?.isConnected ? dialog.trigger : (dialog.trigger?.id ? document.getElementById(dialog.trigger.id) : [...document.querySelectorAll('[data-focus-key]')].find(el => el.dataset.focusKey === dialog.trigger?.dataset.focusKey));
+    if (restoredTrigger) restoredTrigger.focus({preventScroll: true});
+    else if (!previous) document.getElementById('main-content').focus({preventScroll: true});
+}
+
+function dismissDialog(overlay) {
+    deactivateDialog(overlay);
+    overlay.remove();
+}
+
+document.addEventListener('keydown', event => {
+    const active = dialogStack.at(-1);
+    if (event.key === 'Escape') {
+        const picker = document.getElementById('model-path-menu');
+        if (picker?.classList.contains('open')) { hideModelPathMenu(); event.preventDefault(); return; }
+        if (active) { event.preventDefault(); active.close(); return; }
+        document.querySelectorAll('.action-menu[open]').forEach(menu => { menu.open = false; menu.querySelector('summary').focus(); });
+    }
+    if (event.key !== 'Tab' || !active) return;
+    const items = dialogFocusables(active.overlay);
+    const first = items[0];
+    const last = items.at(-1);
+    if (!first) { event.preventDefault(); return; }
+    if (event.shiftKey && (document.activeElement === first || !items.includes(document.activeElement))) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && (document.activeElement === last || !items.includes(document.activeElement))) { event.preventDefault(); first.focus(); }
+});
+document.addEventListener('click', event => {
+    document.querySelectorAll('.action-menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; });
+});
+
+function positionActionMenu(menu) {
+    const items = menu.querySelector('.action-menu-items');
+    if (!items) return;
+    const rect = menu.querySelector('summary').getBoundingClientRect();
+    items.style.left = `${Math.max(12, Math.min(rect.right - 205, window.innerWidth - 217))}px`;
+    items.style.top = `${Math.max(12, Math.min(rect.bottom + 7, window.innerHeight - items.offsetHeight - 12))}px`;
+}
+
+document.addEventListener('toggle', event => {
+    if (event.target.matches('.action-menu[open]')) positionActionMenu(event.target);
+}, true);
+window.addEventListener('scroll', () => {
+    document.querySelectorAll('.action-menu[open]').forEach(positionActionMenu);
+}, true);
+
 function showConfirm(title, message, onConfirm) {
     const overlay = document.createElement('div');
     overlay.className = 'confirm-overlay';
@@ -1777,13 +2902,14 @@ function showConfirm(title, message, onConfirm) {
         </div>`;
 
     document.body.appendChild(overlay);
-    overlay.querySelector('.confirm-cancel').addEventListener('click', () => overlay.remove());
+    activateDialog(overlay, () => dismissDialog(overlay));
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => dismissDialog(overlay));
     overlay.querySelector('.confirm-ok').addEventListener('click', async () => {
-        overlay.remove();
+        dismissDialog(overlay);
         await onConfirm();
     });
     overlay.addEventListener('click', e => {
-        if (e.target === overlay) overlay.remove();
+        if (e.target === overlay) dismissDialog(overlay);
     });
 }
 
@@ -1816,8 +2942,13 @@ async function copyText(text, successMessage) {
 }
 
 function numberOrNull(value) {
+    if (value == null || value === '') return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+}
+
+function formatOutputLimit(value) {
+    return value == null || value === -1 ? 'Unlimited' : `${value.toLocaleString()} tokens`;
 }
 
 function formatVram(used, total) {
@@ -1883,9 +3014,7 @@ function formatCurrency(value) {
 }
 
 function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str ?? '';
-    return div.innerHTML;
+    return String(str ?? '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
 }
 
 function shellQuote(value) {
@@ -1927,6 +3056,17 @@ function option(value, label, selected) {
     return `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`;
 }
 
+function uiIcon(size, paths) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+}
+function searchIcon(size) { return uiIcon(size, '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/>'); }
+function gridIcon(size) { return uiIcon(size, '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'); }
+function listIcon(size) { return uiIcon(size, '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>'); }
+function moreIcon(size) { return uiIcon(size, '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>'); }
+function chipIcon(size) { return uiIcon(size, '<rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 1v4m6-4v4M9 19v4m6-4v4M1 9h4m-4 6h4m14-6h4m-4 6h4"/><rect x="9" y="9" width="6" height="6" rx="1"/>'); }
+function checkIcon(size) { return uiIcon(size, '<path d="m5 12 4 4L19 6"/>'); }
+function eyeIcon(size) { return uiIcon(size, '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'); }
+
 function serverIcon(size) {
     return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/></svg>`;
 }
@@ -1945,6 +3085,10 @@ function chatIcon(size) {
 
 function calculatorIcon(size) {
     return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="10" y2="12"/><line x1="14" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="10" y2="16"/><line x1="14" y1="16" x2="16" y2="16"/></svg>`;
+}
+
+function benchmarkIcon(size) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-5"/><path d="M7 18h10"/></svg>`;
 }
 
 function plusIcon(size) {

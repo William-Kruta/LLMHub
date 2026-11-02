@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import socket
 import time
@@ -11,16 +12,18 @@ import requests as _requests
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
-from .models import AppSettings, BenchmarkResult, EndpointTestResult, GPUStatus, LogAnnotation, ModelScanResult, PortSuggestion, Preset, RAMStatus, ServerConfig, ServerConfigCreate, ServerConfigUpdate, ServerStatus, TokenUsage
+from .models import AppSettings, BenchmarkResult, EndpointTestResult, GPUStatus, LlamaBenchOverview, LlamaBenchRequest, LlamaBenchRun, LogAnnotation, ModelScanResult, PortSuggestion, Preset, RAMStatus, ServerConfig, ServerConfigCreate, ServerConfigUpdate, ServerStatus, TokenUsage
 from . import config_manager
 from . import gpu_monitor
 from . import ram_monitor
 from . import settings_manager
 from . import token_tracker
+from .benchmark_manager import benchmark_manager
 from .process_manager import process_manager
 
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -94,10 +97,20 @@ async def lifespan(app: FastAPI):
     _probe_existing_servers()
     yield
     # Stop all servers on shutdown
+    benchmark_manager.shutdown()
     process_manager.stop_all()
 
 
 app = FastAPI(title="LLM Hub", version="0.1.0", lifespan=lifespan)
+
+# There is no authentication, so reject requests addressed to any other hostname.
+# This blocks DNS-rebinding pages from driving the API from a browser.
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("LLMHUB_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",")
+    if host.strip()
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 # ── API Routes ──────────────────────────────────────────────────────────
@@ -329,6 +342,46 @@ def get_ram() -> RAMStatus | None:
     return ram_monitor.get_ram()
 
 
+@app.get("/api/benchmarks")
+def get_benchmarks() -> LlamaBenchOverview:
+    """Return llama-bench availability, active progress, and recent results."""
+    return benchmark_manager.overview()
+
+
+@app.post("/api/benchmarks", status_code=202)
+def start_benchmark(data: LlamaBenchRequest) -> LlamaBenchRun:
+    """Start a structured llama-bench matrix for a saved model config."""
+    config = config_manager.get_config(data.config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found")
+    if process_manager.is_running(config.id):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop this config's llama-server before benchmarking it.",
+        )
+    try:
+        return benchmark_manager.start(config, data)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/benchmarks/{run_id}/stop")
+def stop_benchmark(run_id: str) -> LlamaBenchRun:
+    """Cancel the active llama-bench process."""
+    run = benchmark_manager.stop(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Active benchmark not found")
+    return run
+
+
+@app.delete("/api/benchmarks", status_code=204)
+def clear_benchmark_history():
+    """Clear completed llama-bench history."""
+    benchmark_manager.clear_history()
+
+
 @app.get("/api/settings")
 def get_settings() -> AppSettings:
     """Return app settings and defaults."""
@@ -492,6 +545,11 @@ def restart_server(config_id: str) -> ServerStatus:
     config = config_manager.get_config(config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+    if process_manager.is_adopted(config_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This server was started outside LLM Hub, so it cannot be restarted here.",
+        )
     process_manager.stop(config_id)
     try:
         process_manager.start(config)
@@ -512,12 +570,13 @@ def get_output(config_id: str, offset: int = 0):
     config = config_manager.get_config(config_id)
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+    running = process_manager.is_running(config_id)
     lines, total = process_manager.get_output(config_id, offset)
     return {
         "lines": lines,
         "total": total,
         "offset": offset,
-        "running": process_manager.is_running(config_id),
+        "running": running,
         "annotations": [item.model_dump() for item in _annotate_lines(lines)],
     }
 
@@ -611,6 +670,22 @@ def _stream_and_record(config_id: str, resp):
             _record_stream_usage(config_id, tail)
 
 
+def _limit_output_tokens(payload: dict, limit: int) -> dict:
+    """Cap completion requests while preserving smaller per-request limits."""
+    if limit == -1:
+        return payload
+    payload = dict(payload)
+    for key in ("max_tokens", "max_completion_tokens", "n_predict"):
+        if key != "max_tokens" and key not in payload:
+            continue
+        requested = payload.get(key)
+        if requested is None or (
+            isinstance(requested, (int, float)) and (requested < 0 or requested > limit)
+        ):
+            payload[key] = limit
+    return payload
+
+
 @app.api_route("/api/configs/{config_id}/v1/{v1_path:path}", methods=["GET", "POST"])
 async def proxy_v1(config_id: str, v1_path: str, request: Request):
     """Proxy OpenAI-compatible requests through LLM Hub so token usage can be tracked."""
@@ -622,8 +697,15 @@ async def proxy_v1(config_id: str, v1_path: str, request: Request):
     try:
         payload = json.loads(body.decode("utf-8")) if body else {}
     except ValueError:
-        payload = {}
+        payload = None
     stream = bool(payload.get("stream")) if isinstance(payload, dict) else False
+    if (
+        request.method == "POST"
+        and v1_path.rstrip("/") in {"chat/completions", "completions"}
+        and isinstance(payload, dict)
+        and config.n_predict != -1
+    ):
+        body = json.dumps(_limit_output_tokens(payload, config.n_predict)).encode("utf-8")
 
     target = _target_url(config, f"/v1/{v1_path}", request.url.query)
     headers = _forward_headers(request)
@@ -669,11 +751,11 @@ def benchmark_endpoint(config_id: str) -> BenchmarkResult:
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
 
-    payload = {
+    payload = _limit_output_tokens({
         "messages": [{"role": "user", "content": "Reply with the word ready."}],
         "max_tokens": 16,
         "temperature": 0,
-    }
+    }, config.n_predict)
     started = time.perf_counter()
     try:
         resp = _requests.post(f"http://{config.host}:{config.port}/v1/chat/completions", json=payload, timeout=30)

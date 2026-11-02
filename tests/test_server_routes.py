@@ -1,5 +1,7 @@
 """Integration tests for the core server-management API."""
 
+import json
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -7,20 +9,28 @@ from fastapi.testclient import TestClient
 
 from llmhub.server import app
 import llmhub.config_manager as cm
+import llmhub.benchmark_manager as bm
 import llmhub.settings_manager as sm
 import llmhub.token_tracker as tt
+from llmhub.models import ServerConfigUpdate
 
 
 @pytest.fixture(autouse=True)
 def isolated_config_file(tmp_path, monkeypatch):
     monkeypatch.setattr(cm, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(bm, "BENCHMARK_HISTORY_FILE", tmp_path / "benchmark_history.json")
     monkeypatch.setattr(sm, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(tt, "TOKEN_USAGE_FILE", tmp_path / "token_usage.json")
+    bm.benchmark_manager._history = []
+    bm.benchmark_manager._active = None
+    bm.benchmark_manager._process = None
+    bm.benchmark_manager._worker = None
+    bm.benchmark_manager._cancel_requested.clear()
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    return TestClient(app, base_url="http://localhost", backend_options={"use_uvloop": True})
 
 
 def test_config_crud_routes(client):
@@ -211,7 +221,21 @@ def test_clear_output_and_download_logs(client, monkeypatch):
     assert logs.text == "a\nb\n"
 
 
-def test_presets_and_free_port(client):
+def test_presets_and_free_port(client, monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, _address):
+            return None
+
+    fake_socket_module = Mock(AF_INET=2, SOCK_STREAM=1)
+    fake_socket_module.socket.return_value = FakeSocket()
+    monkeypatch.setattr("llmhub.server.socket", fake_socket_module)
+
     presets = client.get("/api/presets")
     assert presets.status_code == 200
     assert any(preset["id"] == "cpu" for preset in presets.json())
@@ -455,7 +479,7 @@ def test_proxy_accepts_non_utf8_body(monkeypatch, tmp_path):
     monkeypatch.setattr(cm, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(sm, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(tt, "TOKEN_USAGE_FILE", tmp_path / "token_usage.json")
-    tolerant_client = TestClient(app, raise_server_exceptions=False)
+    tolerant_client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False, backend_options={"use_uvloop": True})
 
     created = tolerant_client.post(
         "/api/configs",
@@ -507,7 +531,7 @@ def test_proxy_does_not_block_other_requests(monkeypatch):
 
     # A context-managed TestClient shares one event loop across requests,
     # so a handler that blocks the loop stalls the concurrent request below.
-    with TestClient(app) as shared:
+    with TestClient(app, base_url="http://localhost", backend_options={"use_uvloop": True}) as shared:
         created = shared.post(
             "/api/configs",
             json={"name": "Slow Proxy", "model_path": "/tmp/model.gguf", "port": 8100},
@@ -649,3 +673,189 @@ def test_reset_token_usage(client, monkeypatch):
     assert reset.status_code == 200
     assert reset.json()["prompt_tokens"] == 0
     assert client.get(f"/api/configs/{config_id}/tokens").json()["total_tokens"] == 0
+
+
+def test_llama_benchmark_routes(client, tmp_path):
+    model = tmp_path / "benchmark-model.gguf"
+    model.write_text("model")
+    binary = tmp_path / "llama-bench"
+    result = json.dumps([{"n_prompt": 512, "n_gen": 0, "avg_ts": 222.5, "stddev_ts": 2.0}])
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "print('running benchmark', file=sys.stderr, flush=True)\n"
+        f"print({result!r})\n"
+    )
+    binary.chmod(0o755)
+    created = client.post(
+        "/api/configs",
+        json={"name": "Route Benchmark", "model_path": str(model)},
+    ).json()
+    config_id = created["config"]["id"]
+
+    started = client.post(
+        "/api/benchmarks",
+        json={
+            "config_id": config_id,
+            "binary_path": str(binary),
+            "prompt_tokens": [512],
+            "generation_tokens": [],
+            "threads": [4],
+            "gpu_layers": [0],
+            "batch_sizes": [2048],
+            "ubatch_sizes": [512],
+            "flash_attention": ["auto"],
+            "repetitions": 2,
+        },
+    )
+
+    assert started.status_code == 202
+    deadline = time.monotonic() + 3
+    overview = client.get("/api/benchmarks")
+    while overview.json()["active"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+        overview = client.get("/api/benchmarks")
+
+    assert overview.status_code == 200
+    assert overview.json()["active"] is None
+    assert overview.json()["history"][0]["status"] == "completed"
+    assert overview.json()["history"][0]["results"][0]["avg_ts"] == 222.5
+
+    cleared = client.delete("/api/benchmarks")
+    assert cleared.status_code == 204
+    assert client.get("/api/benchmarks").json()["history"] == []
+
+
+def test_llama_benchmark_rejects_running_config(client, monkeypatch):
+    created = client.post(
+        "/api/configs",
+        json={"name": "Busy Benchmark", "model_path": "/tmp/model.gguf"},
+    ).json()
+    monkeypatch.setattr("llmhub.server.process_manager.is_running", lambda _id: True)
+
+    response = client.post(
+        "/api/benchmarks",
+        json={"config_id": created["config"]["id"]},
+    )
+
+    assert response.status_code == 409
+    assert "Stop this config" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", list(ServerConfigUpdate.model_fields))
+def test_null_config_updates_are_rejected_without_corrupting_storage(client, field):
+    created = client.post("/api/configs", json={"name": "Valid", "model_path": "/tmp/model.gguf"}).json()["config"]
+    response = client.put(f"/api/configs/{created['id']}", json={field: None})
+
+    assert response.status_code == 422
+    listed = client.get("/api/configs")
+    assert listed.status_code == 200
+    assert listed.json()[0]["config"] == created
+
+
+def test_output_token_limit_persists_through_config_workflows(client):
+    response = client.post("/api/configs", json={"name": "Limited", "model_path": "/tmp/model.gguf", "n_predict": 2048})
+    assert response.status_code == 201
+    config_id = response.json()["config"]["id"]
+    assert response.json()["command"][-2:] == ["--n-predict", "2048"]
+    assert client.get(f"/api/configs/{config_id}").json()["config"]["n_predict"] == 2048
+    assert client.post(f"/api/configs/{config_id}/duplicate").json()["config"]["n_predict"] == 2048
+    exported = client.get(f"/api/configs/{config_id}/export").json()
+    assert client.post("/api/configs/import", json=exported).json()[0]["config"]["n_predict"] == 2048
+
+    assert client.put(f"/api/configs/{config_id}", json={"n_predict": 128}).json()["config"]["n_predict"] == 128
+    assert client.get(f"/api/configs/{config_id}/command").json()["command"][-2:] == ["--n-predict", "128"]
+    assert client.put(f"/api/configs/{config_id}", json={"n_predict": -2}).status_code == 422
+    assert client.post("/api/configs", json={"name": "Invalid", "model_path": "/tmp/model.gguf", "n_predict": -2}).status_code == 422
+    assert client.post("/api/configs/import", json={**exported, "n_predict": -2}).status_code == 422
+
+
+@pytest.mark.parametrize("endpoint", ["chat/completions", "completions"])
+@pytest.mark.parametrize("requested,expected", [
+    ({}, {"max_tokens": 128}),
+    ({"max_tokens": 512}, {"max_tokens": 128}),
+    ({"max_tokens": 32}, {"max_tokens": 32}),
+    ({"max_tokens": -1}, {"max_tokens": 128}),
+    ({"max_tokens": 0}, {"max_tokens": 0}),
+    ({"max_completion_tokens": 512, "n_predict": 512}, {"max_tokens": 128, "max_completion_tokens": 128, "n_predict": 128}),
+    ({"max_completion_tokens": 32, "n_predict": 16}, {"max_tokens": 128, "max_completion_tokens": 32, "n_predict": 16}),
+])
+def test_proxy_caps_output_tokens(client, monkeypatch, endpoint, requested, expected):
+    config = client.post("/api/configs", json={"name": "Limited", "model_path": "/tmp/model.gguf", "n_predict": 128}).json()["config"]
+    upstream = Mock(ok=True, status_code=200, content=b"{}", headers={"content-type": "application/json"})
+    upstream.json.return_value = {}
+    forward = Mock(return_value=upstream)
+    monkeypatch.setattr("llmhub.server._requests.request", forward)
+    payload = {"messages": [{"role": "user", "content": "hello"}], **requested}
+
+    response = client.post(f"/api/configs/{config['id']}/v1/{endpoint}", json=payload)
+
+    assert response.status_code == 200
+    assert json.loads(forward.call_args.kwargs["data"]) == {"messages": payload["messages"], **expected}
+
+
+def test_streaming_proxy_caps_output_tokens(client, monkeypatch):
+    config = client.post("/api/configs", json={"name": "Stream", "model_path": "/tmp/model.gguf", "n_predict": 16}).json()["config"]
+    upstream = Mock(ok=True, status_code=200, headers={"content-type": "text/event-stream"})
+    upstream.iter_content.return_value = iter([b"data: [DONE]\n\n"])
+    forward = Mock(return_value=upstream)
+    monkeypatch.setattr("llmhub.server._requests.request", forward)
+
+    response = client.post(f"/api/configs/{config['id']}/v1/chat/completions", json={"stream": True, "max_tokens": 512})
+
+    assert response.content == b"data: [DONE]\n\n"
+    assert forward.call_args.kwargs["stream"] is True
+    assert json.loads(forward.call_args.kwargs["data"])["max_tokens"] == 16
+    upstream.close.assert_called_once()
+
+
+def test_quick_benchmark_obeys_output_token_limit(client, monkeypatch):
+    config = client.post("/api/configs", json={"name": "Small", "model_path": "/tmp/model.gguf", "n_predict": 4}).json()["config"]
+    upstream = Mock(ok=True)
+    upstream.json.return_value = {}
+    forward = Mock(return_value=upstream)
+    monkeypatch.setattr("llmhub.server._requests.post", forward)
+
+    assert client.post(f"/api/configs/{config['id']}/benchmark").json()["ok"] is True
+    assert forward.call_args.kwargs["json"]["max_tokens"] == 4
+
+
+def test_startup_probe_adopts_already_running_server(monkeypatch):
+    import llmhub.server as server
+
+    created = cm.create_config(
+        server.ServerConfigCreate(name="External", model_path="/models/external.gguf", port=8091)
+    )
+    health = Mock(status_code=200)
+    props = Mock(status_code=200)
+    props.json.return_value = {"model_path": "/elsewhere/external.gguf"}
+    monkeypatch.setattr(server._requests, "get", lambda url, timeout: health if url.endswith("/health") else props)
+
+    try:
+        server._probe_existing_servers()
+        assert server.process_manager.is_adopted(created.id)
+    finally:
+        server.process_manager.stop(created.id)
+
+
+def test_restart_refuses_externally_started_server(client):
+    import llmhub.server as server
+
+    config_id = client.post(
+        "/api/configs", json={"name": "External", "model_path": "/tmp/model.gguf"}
+    ).json()["config"]["id"]
+    server.process_manager.adopt(config_id)
+    try:
+        response = client.post(f"/api/configs/{config_id}/restart")
+        assert response.status_code == 409
+        # The server must still be tracked rather than silently untracked.
+        assert server.process_manager.is_adopted(config_id)
+    finally:
+        server.process_manager.stop(config_id)
+
+
+def test_requests_for_untrusted_hosts_are_rejected():
+    rebinding_client = TestClient(app, base_url="http://attacker.example", backend_options={"use_uvloop": True})
+    assert rebinding_client.get("/api/configs").status_code == 400
+    loopback_client = TestClient(app, base_url="http://127.0.0.1:8005", backend_options={"use_uvloop": True})
+    assert loopback_client.get("/api/configs").status_code == 200

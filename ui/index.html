@@ -6,13 +6,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM Hub — llama.cpp Server Manager</title>
     <meta name="description" content="Manage your llama.cpp server instances from a single dashboard.">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/ui/styles.css">
+    <link rel="stylesheet" href="/ui/workspace.css">
 </head>
 
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     <!-- Sidebar -->
-    <nav class="sidebar" id="sidebar">
+    <nav class="sidebar" id="sidebar" aria-label="Main navigation">
         <div class="sidebar-brand">
             <div class="brand-icon">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -33,7 +34,8 @@
         </div>
 
         <div class="sidebar-nav">
-            <a href="#hub" class="nav-item active" data-page="hub" id="nav-hub">
+            <div class="nav-caption">Workspace</div>
+            <a href="#hub" class="nav-item active" data-page="hub" id="nav-hub" aria-label="Overview" title="Overview">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <rect x="3" y="3" width="7" height="7" />
@@ -41,9 +43,9 @@
                     <rect x="14" y="14" width="7" height="7" />
                     <rect x="3" y="14" width="7" height="7" />
                 </svg>
-                <span>Hub</span>
+                <span>Overview</span>
             </a>
-            <a href="#configs" class="nav-item" data-page="configs" id="nav-configs">
+            <a href="#configs" class="nav-item" data-page="configs" id="nav-configs" aria-label="Configurations" title="Configurations">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <rect x="4" y="5" width="16" height="14" rx="2" />
@@ -53,7 +55,7 @@
                 </svg>
                 <span>Configs</span>
             </a>
-            <a href="#terminal" class="nav-item" data-page="terminal" id="nav-terminal">
+            <a href="#terminal" class="nav-item" data-page="terminal" id="nav-terminal" aria-label="Terminal" title="Terminal">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="4 17 10 11 4 5" />
@@ -61,7 +63,7 @@
                 </svg>
                 <span>Terminal</span>
             </a>
-            <a href="#chat" class="nav-item" data-page="chat" id="nav-chat">
+            <a href="#chat" class="nav-item" data-page="chat" id="nav-chat" aria-label="Chat" title="Chat">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
@@ -70,7 +72,16 @@
                 </svg>
                 <span>Chat</span>
             </a>
-            <a href="#token-calculator" class="nav-item" data-page="token-calculator" id="nav-token-calculator">
+            <a href="#benchmark" class="nav-item" data-page="benchmark" id="nav-benchmark" aria-label="Benchmark" title="Benchmark">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 18a8 8 0 1 1 16 0" />
+                    <path d="M12 18l4-5" />
+                    <path d="M7 18h10" />
+                </svg>
+                <span>Benchmark</span>
+            </a>
+            <a href="#token-calculator" class="nav-item" data-page="token-calculator" id="nav-token-calculator" aria-label="Token usage" title="Token usage">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <rect x="4" y="3" width="16" height="18" rx="2" />
@@ -80,9 +91,9 @@
                     <line x1="8" y1="16" x2="10" y2="16" />
                     <line x1="14" y1="16" x2="16" y2="16" />
                 </svg>
-                <span>Token Calculator</span>
+                <span>Token usage</span>
             </a>
-            <a href="#settings" class="nav-item" data-page="settings" id="nav-settings">
+            <a href="#settings" class="nav-item" data-page="settings" id="nav-settings" aria-label="Settings" title="Settings">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="12" cy="12" r="3" />
@@ -93,20 +104,24 @@
         </div>
 
         <div class="sidebar-footer">
-            <div class="version-badge">v0.1.0</div>
+            <div class="workspace-badge"><span class="status-dot"></span><span>Local workspace</span></div><div class="version-badge">LLM Hub · v0.1.0</div>
         </div>
     </nav>
 
-    <!-- Main Content -->
-    <main class="main-content" id="main-content">
-        <!-- Pages are rendered dynamically by app.js -->
-    </main>
+    <div class="workspace-shell">
+        <header class="workspace-header">
+            <div class="breadcrumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="page-label">Overview</strong></div>
+            <span class="connection-indicator" id="connection-indicator"><span class="status-dot"></span>Connecting</span>
+        </header>
+        <div id="connection-notice" class="connection-notice" role="status" hidden></div>
+        <main class="main-content" id="main-content" tabindex="-1" aria-busy="true"></main>
+    </div>
 
     <!-- Config Modal -->
-    <div class="modal-overlay" id="config-modal">
-        <div class="modal">
+    <div class="modal-overlay" id="config-modal" inert>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">
             <div class="modal-header">
-                <h2 id="modal-title">New Configuration</h2>
+                <div><span class="eyebrow">Model workspace</span><h2 id="modal-title">New configuration</h2></div>
                 <button class="modal-close" id="modal-close" aria-label="Close modal">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -115,95 +130,62 @@
                     </svg>
                 </button>
             </div>
-            <form id="config-form">
+            <form id="config-form" novalidate>
                 <input type="hidden" id="config-id">
-                <div class="form-grid">
-                    <div class="form-group full-width">
-                        <label for="config-name">Server Name</label>
-                        <input type="text" id="config-name" placeholder="My LLM Server" required>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-model-path">Model Path</label>
-                        <div class="model-path-combobox">
-                            <input type="text" id="config-model-path" placeholder="/path/to/model.gguf" required autocomplete="off">
-                            <div class="model-path-menu" id="model-path-menu" role="listbox"></div>
+                <div id="config-form-error" class="form-error-summary" role="alert" hidden></div>
+                <div class="config-sections">
+                    <fieldset class="config-section">
+                        <legend>Model</legend><p class="section-description">Choose a model and give this configuration a name.</p>
+                        <div class="form-grid">
+                            <div class="form-group"><label for="config-name">Name</label><input type="text" id="config-name" placeholder="My local model" required></div>
+                            <div class="form-group"><label for="config-preset">Preset</label><select id="config-preset"><option value="custom">Custom</option></select></div>
+                            <div class="form-group full-width">
+                                <label for="config-model-path">Model file</label>
+                                <div class="model-path-combobox"><input type="text" id="config-model-path" placeholder="/path/to/model.gguf" required autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="model-path-menu"><div class="model-path-menu" id="model-path-menu" role="listbox" aria-label="Available models"></div></div>
+                                <span class="form-hint" id="model-path-hint">Path to a GGUF model on this computer.</span>
+                            </div>
                         </div>
-                        <span class="form-hint" id="model-path-hint"></span>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-preset">Preset</label>
-                        <select id="config-preset">
-                            <option value="custom">Custom</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="config-host">Host</label>
-                        <input type="text" id="config-host" value="127.0.0.1">
-                    </div>
-                    <div class="form-group">
-                        <label for="config-port">Port</label>
-                        <input type="number" id="config-port" value="8080" min="1" max="65535">
-                        <button type="button" class="btn btn-ghost btn-sm field-action" id="find-port-btn">Find free port</button>
-                    </div>
-                    <div class="form-group">
-                        <label for="config-gpu-layers">GPU Layers</label>
-                        <input type="number" id="config-gpu-layers" value="-1" min="-1">
-                        <span class="form-hint">-1 = all layers</span>
-                    </div>
-                    <div class="form-group">
-                        <label for="config-ctx-size">Context Size</label>
-                        <input type="number" id="config-ctx-size" value="4096" min="128">
-                    </div>
-                    <div class="form-group">
-                        <label for="config-threads">Threads</label>
-                        <input type="number" id="config-threads" value="4" min="1">
-                    </div>
-                    <div class="form-group">
-                        <label for="config-parallel">Parallel Slots</label>
-                        <input type="number" id="config-parallel" value="1" min="1">
-                    </div>
-                    <div class="form-group full-width">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="config-cont-batching" checked>
-                            <span class="checkmark"></span>
-                            Continuous Batching
-                        </label>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-mmproj-path">MMProj Path</label>
-                        <input type="text" id="config-mmproj-path" placeholder="/path/to/model.mmproj">
-                        <span class="form-hint">Path to a multimodal projector file (optional, for vision models)</span>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-extra-args">Extra Arguments</label>
-                        <input type="text" id="config-extra-args" placeholder="--jinja --temp 0.8">
-                        <span class="form-hint">Additional CLI flags passed to llama-server</span>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-advanced-args">Advanced Flags</label>
-                        <textarea id="config-advanced-args" rows="3" placeholder="--flash-attn&#10;--cache-type-k q8_0"></textarea>
-                        <span class="form-hint">One structured llama-server argument per line. Use raw extra args only when needed.</span>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="config-env-vars">Environment Variables</label>
-                        <textarea id="config-env-vars" rows="3" placeholder="CUDA_VISIBLE_DEVICES=0&#10;GGML_CUDA_FORCE_MMQ=1"></textarea>
-                        <span class="form-hint">One KEY=value entry per line, passed only to this server process.</span>
-                    </div>
-                    <div class="form-group full-width">
-                        <label for="command-preview">Command Preview</label>
-                        <pre class="command-preview" id="command-preview"></pre>
-                    </div>
+                    </fieldset>
+                    <fieldset class="config-section">
+                        <legend>Generation</legend><p class="section-description">Set the context window and response length.</p>
+                        <div class="form-grid">
+                            <div class="form-group"><label for="config-ctx-size">Context size</label><input type="number" id="config-ctx-size" value="4096" min="128" step="1" required><span class="form-hint">Tokens available for the conversation.</span></div>
+                            <div class="form-group">
+                                <div class="field-label-row"><label for="config-output-tokens">Output tokens</label><label class="switch-label" for="config-output-unlimited"><input type="checkbox" id="config-output-unlimited" checked>Unlimited</label></div>
+                                <input type="number" id="config-output-tokens" value="512" min="0" step="1" required disabled>
+                                <span class="form-hint">Maximum per response. Zero disables generation.</span>
+                            </div>
+                        </div>
+                    </fieldset>
+                    <fieldset class="config-section">
+                        <legend>Hardware</legend><p class="section-description">Balance speed, memory, and concurrent requests.</p>
+                        <div class="form-grid hardware-grid">
+                            <div class="form-group"><label for="config-gpu-layers">GPU layers</label><input type="number" id="config-gpu-layers" value="-1" min="-1" step="1" required><span class="form-hint">-1: all layers · 0: CPU only</span></div>
+                            <div class="form-group"><label for="config-threads">CPU threads</label><input type="number" id="config-threads" value="4" min="1" step="1" required></div>
+                            <div class="form-group"><label for="config-parallel">Parallel slots</label><input type="number" id="config-parallel" value="1" min="1" step="1" required></div>
+                        </div>
+                    </fieldset>
+                    <details class="config-section advanced-section" id="config-advanced-section">
+                        <summary><span>Advanced</span><span class="summary-hint">Network, vision &amp; runtime options</span></summary>
+                        <div class="form-grid">
+                            <div class="form-group"><label for="config-host">Host</label><input type="text" id="config-host" value="127.0.0.1" required></div>
+                            <div class="form-group"><label for="config-port">Port</label><div class="input-action"><input type="number" id="config-port" value="8080" min="1" max="65535" step="1" required><button type="button" class="btn btn-ghost btn-sm" id="find-port-btn">Find free</button></div></div>
+                            <div class="form-group full-width"><label class="checkbox-label"><input type="checkbox" id="config-cont-batching" checked><span class="checkmark"></span>Continuous batching</label></div>
+                            <div class="form-group full-width"><label for="config-mmproj-path">Vision projector</label><input type="text" id="config-mmproj-path" placeholder="/path/to/mmproj.gguf"><span class="form-hint">Optional .mmproj or .gguf projector for vision models.</span></div>
+                            <div class="form-group full-width"><label for="config-extra-args">Extra arguments</label><input type="text" id="config-extra-args" placeholder="--jinja --temp 0.8"></div>
+                            <div class="form-group full-width"><label for="config-advanced-args">Structured arguments</label><textarea id="config-advanced-args" rows="3" placeholder="--cache-type-k&#10;q8_0"></textarea><span class="form-hint">One argument or value per line.</span></div>
+                            <div class="form-group full-width"><label for="config-env-vars">Environment variables</label><textarea id="config-env-vars" rows="3" placeholder="CUDA_VISIBLE_DEVICES=0"></textarea><span class="form-hint">One KEY=value entry per line.</span></div>
+                            <div class="form-group full-width"><label for="command-preview">Command preview</label><pre class="command-preview" id="command-preview"></pre></div>
+                        </div>
+                    </details>
                 </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn btn-ghost" id="modal-cancel">Cancel</button>
-                    <button type="submit" class="btn btn-primary" id="modal-save">Save Configuration</button>
-                </div>
+                <div class="modal-actions"><span class="save-hint">Saved on this computer</span><button type="button" class="btn btn-ghost" id="modal-cancel">Cancel</button><button type="submit" class="btn btn-primary" id="modal-save">Save configuration</button></div>
             </form>
         </div>
     </div>
 
     <!-- Toast container -->
-    <div class="toast-container" id="toast-container"></div>
+    <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
     <script src="/ui/app.js"></script>
 </body>

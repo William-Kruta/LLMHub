@@ -1,7 +1,7 @@
 [project]
 name = "llmhub"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local web interface for configuring and managing llama.cpp model servers"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
